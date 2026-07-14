@@ -1,6 +1,33 @@
 # pi-spacexai
 
-A pi extension providing the `spacexai` model provider, xAI subscription OAuth/API-key authentication, xAI server-side search/code tools, and the complete documented xAI REST media tools.
+Bring the full Grok ecosystem into pi: subscription-backed models, Grok Imagine, speech generation and transcription, and a harness that can speak its responses aloud.
+
+## Why pi-spacexai is cool
+
+### 1. Use your Grok subscription
+
+Sign in through xAI's device OAuth flow and use an eligible **SuperGrok or X subscription** directly inside pi—no separate metered API key required. The extension refreshes OAuth credentials automatically and registers Grok chat and coding models as a native `spacexai` provider. API-key authentication remains available as an optional fallback.
+
+Grok also receives xAI's server-side `web_search`, `x_search`, and `code_interpreter` tools alongside pi's normal local tools.
+
+### 2. Full Grok Imagine support with detailed control
+
+Generate and edit images, or create, edit, and extend videos without leaving the coding harness. Requests expose the documented Grok Imagine controls rather than hiding them behind simplified presets:
+
+- Text-to-image and image editing with up to three source images
+- 1–10 image variations, every supported aspect ratio, and 1K/2K resolution
+- Text-to-video, image-to-video, and reference-to-video workflows
+- Exact video duration control in seconds, aspect ratio, and 480p/720p/1080p resolution
+- Video editing and 2–10 second extensions
+- Automatic job polling, output downloading, and explicit destination paths
+
+### 3. Generate and transcribe audio with TTS/STT
+
+Create production-ready speech files with full control over voice, language, speed, codec, sample rate, MP3 bit rate, streaming-latency optimization, text normalization, and character-level timestamps. Transcribe local files or URLs with formatting, word timing, speaker diarization, multichannel audio, keyterm biasing, and filler-word controls.
+
+### 4. Let the harness speak—and shape how it sounds
+
+Use `/listen` to hear the latest assistant response or `/auto-listen-on` to make pi speak every completed response automatically. Choose a voice and persist a speaking style so the assistant writes naturally for spoken delivery, including supported xAI speech tags when appropriate.
 
 ## Load and authenticate
 
