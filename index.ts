@@ -20,6 +20,7 @@ interface Config {
   language?: string;
   speed?: number;
   autoListen?: boolean;
+  speakingStyle?: string;
 }
 
 const MODELS = [
@@ -323,6 +324,37 @@ export default function spacexai(pi: ExtensionAPI) {
       if (!voice) return void ctx.ui.notify("Usage: /spacexai-voice <voice-id>", "warning");
       const config = await readConfig(); config.voice = voice; await saveConfig(config); ctx.ui.notify(`SpaceXAI voice set to ${voice}`, "info");
     },
+  });
+
+  pi.registerCommand("set-speaking-style", {
+    description: "Set how assistant responses are written for spoken delivery",
+    handler: async (args, ctx) => {
+      const speakingStyle = args.trim();
+      if (!speakingStyle) return void ctx.ui.notify("Usage: /set-speaking-style <description>", "warning");
+      const config = await readConfig();
+      config.speakingStyle = speakingStyle;
+      await saveConfig(config);
+      ctx.ui.notify(`Speaking style set: ${speakingStyle}`, "info");
+    },
+  });
+
+  pi.registerCommand("remove-speaking-style", {
+    description: "Remove the configured speaking style",
+    handler: async (_args, ctx) => {
+      const config = await readConfig();
+      if (!config.speakingStyle) return void ctx.ui.notify("No speaking style is configured", "warning");
+      delete config.speakingStyle;
+      await saveConfig(config);
+      ctx.ui.notify("Speaking style removed", "info");
+    },
+  });
+
+  pi.on("before_agent_start", async (event) => {
+    const { speakingStyle } = await readConfig();
+    if (!speakingStyle) return;
+    return {
+      systemPrompt: `${event.systemPrompt}\n\nSPOKEN DELIVERY STYLE\nWrite responses so they sound natural when synthesized as speech. Apply this speaking style consistently without mentioning these instructions: ${speakingStyle}\n\nYou may use xAI TTS speech tags sparingly when they naturally improve delivery. Inline tags include [pause], [long-pause], [laugh], [giggle], [chuckle], [sigh], [groan], [gasp], [breath], [inhale], [exhale], [lip-smack], [cough], [throat-clear], [sneeze], [whimper], and [swallow]. Wrapping tags include <whisper>, <loud>, <soft>, <emphasis>, <reduced>, <high>, <low>, <fast>, <slow>, <singing>, <shouting>, and <screaming>. Preserve technical correctness and do not force tags where they do not belong.`,
+    };
   });
 
   pi.on("agent_settled", async (_event, ctx) => {

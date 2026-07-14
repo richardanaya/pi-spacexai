@@ -35,6 +35,8 @@ Existing commands remain available:
 /auto-listen-on
 /auto-listen-off
 /spacexai-voice eve
+/set-speaking-style warm, measured, and conversational
+/remove-speaking-style
 ```
 
-Playback requires `ffplay` from FFmpeg. TTS text is limited to 15,000 characters. Slash-command configuration is stored at `~/.pi/spacexai.json` with user-only permissions. This extension intentionally provides file-based REST STT and no WebSocket tools.
+Playback requires `ffplay` from FFmpeg. TTS text is limited to 15,000 characters. `/set-speaking-style` stores a persistent style description and injects it into the system prompt so responses are written for that delivery; `/remove-speaking-style` clears it. Slash-command configuration is stored at `~/.pi/spacexai.json` with user-only permissions. This extension intentionally provides file-based REST STT and no WebSocket tools.
