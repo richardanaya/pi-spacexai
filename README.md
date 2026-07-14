@@ -42,12 +42,12 @@ Every `spacexai` Responses API request also exposes xAI's server-side `web_searc
 
 ## REST media tools
 
-- `spacexai_image_generate`: model, prompt, 1–10 images, every documented aspect ratio, 1k/2k resolution, URL/base64 response, and a required output path.
-- `spacexai_image_edit`: single or up to three source images, all documented edit options, and a required output path.
-- `spacexai_video_generate`: text-, image-, or reference-to-video; model, prompt, duration, aspect ratio, resolution, and a required output path. It polls until completion and downloads the video.
-- `spacexai_video_edit`: prompt/video, documented (service-ignored) geometry fields, and a required output path. It polls until completion.
-- `spacexai_video_extend`: prompt/video, optional 2–10 second extension duration, and a required output path. It polls until completion.
-- `spacexai_video_status`: poll by request ID and download completed video to a required output path.
+- `spacexai_grok_image_generate`: model, prompt, 1–10 images, every documented aspect ratio, 1k/2k resolution, URL/base64 response, and a required output path.
+- `spacexai_grok_image_edit`: single or up to three source images, all documented edit options, and a required output path.
+- `spacexai_grok_video_generate`: text-, image-, or reference-to-video; model, prompt, duration, aspect ratio, resolution, and a required output path. It polls until completion and downloads the video.
+- `spacexai_grok_video_edit`: prompt/video, documented (service-ignored) geometry fields, and a required output path. It polls until completion.
+- `spacexai_grok_video_extend`: prompt/video, optional 2–10 second extension duration, and a required output path. It polls until completion.
+- `spacexai_grok_video_status`: poll by request ID and download completed video to a required output path.
 - `spacexai_tts`: text/language, voice, speed, codec, sample rate, MP3 bit rate, latency optimization, normalization, timestamps, and a required `outputPath`. The tool only saves audio and does not play it. Timestamp envelopes can be saved separately.
 - `spacexai_stt`: file or URL transcription with raw format/sample rate, language/formatting, multichannel/channels, diarization, repeatable keyterms, and filler-word options.
 - `spacexai_voices`: list available built-in and custom voices.
