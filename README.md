@@ -1,6 +1,6 @@
 # pi-spacexai
 
-A pi extension providing the `spacexai` model provider, xAI subscription OAuth/API-key authentication, and the complete documented xAI REST media tools.
+A pi extension providing the `spacexai` model provider, xAI subscription OAuth/API-key authentication, xAI server-side search/code tools, and the complete documented xAI REST media tools.
 
 ## Load and authenticate
 
@@ -10,6 +10,8 @@ pi -e ./index.ts                 # development
 ```
 
 Run `/login spacexai` for xAI device OAuth (eligible SuperGrok/X subscription), or set `SPACEXAI_API_KEY=xai-...` for metered API-key access. Credentials are refreshed by pi. Select bundled Grok models using `/model` under provider `spacexai` (`grok-4.5`, `grok-4.3`, `grok-build`, `grok-build-0.1`, and `grok-composer-2.5-fast`).
+
+Every `spacexai` Responses API request also exposes xAI's server-side `web_search`, `x_search`, and `code_interpreter` tools to Grok. Grok decides when to invoke them alongside pi's normal client-side function tools.
 
 ## REST media tools
 

@@ -243,6 +243,25 @@ export default function spacexai(pi: ExtensionAPI) {
     oauth: { name: "SpaceXAI / SuperGrok", login, refreshToken, getApiKey: (credentials) => credentials.access },
   });
 
+  // xAI Responses executes these tools server-side. They are distinct from pi's
+  // client-side function tools and can coexist in the same request.
+  pi.on("before_provider_request", (event, ctx) => {
+    if (ctx.model?.provider !== PROVIDER) return;
+    if (!event.payload || typeof event.payload !== "object") return;
+    const payload = event.payload as Record<string, unknown>;
+    const tools = Array.isArray(payload.tools) ? [...payload.tools] : [];
+    const existingTypes = new Set(
+      tools
+        .filter((tool): tool is Record<string, unknown> => !!tool && typeof tool === "object")
+        .map((tool) => tool.type)
+        .filter((type): type is string => typeof type === "string"),
+    );
+    for (const type of ["web_search", "x_search", "code_interpreter"]) {
+      if (!existingTypes.has(type)) tools.push({ type });
+    }
+    return { ...payload, tools };
+  });
+
   const aspectImage = Type.Union(["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20", "auto"].map(Type.Literal));
   const aspectVideo = Type.Union(["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"].map(Type.Literal));
   const imageCommon = { model: Type.String({ description: "grok-imagine-image or grok-imagine-image-quality" }), prompt: Type.String(), aspect_ratio: Type.Optional(aspectImage), resolution: Type.Optional(Type.Union([Type.Literal("1k"), Type.Literal("2k")])), response_format: Type.Optional(Type.Union([Type.Literal("url"), Type.Literal("b64_json")])), outputPath: Type.String({ description: "Required destination filename; numbered when n > 1" }) };
