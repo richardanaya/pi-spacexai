@@ -1,13 +1,38 @@
 {
   "name": "pi-spacexai",
-  "version": "0.1.0",
-  "description": "SpaceXAI OAuth provider and TTS tools for pi",
+  "version": "0.0.1",
+  "description": "SpaceXAI OAuth provider, server-side Grok tools, and full image, video, TTS, and STT tools for pi",
   "license": "MIT",
   "author": "Richard Anaya",
   "type": "module",
-  "keywords": ["pi-package", "spacexai", "xai", "grok", "oauth", "tts"],
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/richardanaya/pi-spacexai.git"
+  },
+  "homepage": "https://github.com/richardanaya/pi-spacexai#readme",
+  "bugs": {
+    "url": "https://github.com/richardanaya/pi-spacexai/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "spacexai",
+    "xai",
+    "grok",
+    "oauth",
+    "tts",
+    "stt",
+    "image-generation",
+    "video-generation"
+  ],
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
