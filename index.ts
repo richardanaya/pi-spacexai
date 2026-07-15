@@ -399,9 +399,12 @@ export default function spacexai(pi: ExtensionAPI) {
   });
 
   // F12 toggle: stop TTS if playing, else start/stop mic → STT → send (from pi-xai-tts).
+  // Prefer arecord/ffmpeg over sox `rec`: sox_ng often writes an empty/invalid WAV on stop.
   let isRecording = false;
   let recordingProcess: ChildProcess | null = null;
+  let recordingCmd: string | null = null;
   let recordingTimeout: ReturnType<typeof setTimeout> | null = null;
+  const MIC_FIXED_PATH = join(homedir(), ".pi", "spacexai-mic-fixed.wav");
 
   function setMicWidget(ctx: ExtensionContext, on: boolean): void {
     if (!ctx.hasUI) return;
@@ -418,38 +421,92 @@ export default function spacexai(pi: ExtensionAPI) {
     );
   }
 
+  function waitForExit(proc: ChildProcess, ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      if (proc.exitCode !== null || proc.killed) return resolve();
+      const timer = setTimeout(resolve, ms);
+      proc.once("exit", () => { clearTimeout(timer); resolve(); });
+    });
+  }
+
+  async function stopRecorder(): Promise<void> {
+    const proc = recordingProcess;
+    recordingProcess = null;
+    if (!proc || proc.exitCode !== null) return;
+    // ffmpeg finalizes the WAV on SIGINT; SIGTERM is fine for arecord.
+    const signal = recordingCmd === "ffmpeg" ? "SIGINT" : "SIGTERM";
+    try { proc.kill(signal); } catch { /* already gone */ }
+    await waitForExit(proc, 1500);
+    if (proc.exitCode === null) {
+      try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+      await waitForExit(proc, 500);
+    }
+  }
+
+  /** Ensure a non-empty PCM WAV; re-mux via ffmpeg when available. */
+  async function loadRecordingWav(): Promise<Buffer> {
+    let audioBuffer = await readFile(MIC_PATH);
+    // Empty sox header-only files are ~44 bytes and break STT format sniffing.
+    if (audioBuffer.length < 1024 || audioBuffer.subarray(0, 4).toString("ascii") !== "RIFF") {
+      throw new Error(`Recording failed — no usable audio captured (${audioBuffer.length} bytes)`);
+    }
+    if (await commandExists("ffmpeg")) {
+      try {
+        await execAsync(
+          `ffmpeg -y -hide_banner -loglevel error -i ${JSON.stringify(MIC_PATH)} -ar 16000 -ac 1 -c:a pcm_s16le ${JSON.stringify(MIC_FIXED_PATH)}`,
+          { timeout: 15_000 },
+        );
+        const fixed = await readFile(MIC_FIXED_PATH);
+        if (fixed.length >= 1024) audioBuffer = fixed;
+      } catch {
+        // Keep original capture if re-mux fails.
+      } finally {
+        await unlink(MIC_FIXED_PATH).catch(() => {});
+      }
+    }
+    return audioBuffer;
+  }
+
   async function startRecording(ctx: ExtensionContext): Promise<void> {
     if (isRecording) return;
 
-    const hasRec = await commandExists("rec");
     const hasArecord = await commandExists("arecord");
     const hasFfmpeg = await commandExists("ffmpeg");
-    if (!hasRec && !hasArecord && !hasFfmpeg) {
-      ctx.ui.notify("No audio recorder found. Install sox (rec), arecord, or ffmpeg.", "error");
+    const hasRec = await commandExists("rec");
+    if (!hasArecord && !hasFfmpeg && !hasRec) {
+      ctx.ui.notify("No audio recorder found. Install arecord, ffmpeg, or sox (rec).", "error");
       return;
     }
 
     let cmd: string;
     let args: string[];
-    if (hasRec) {
-      cmd = "rec";
-      args = ["-q", "-c", "1", "-r", "16000", "-b", "16", "-e", "signed-integer", MIC_PATH];
-    } else if (hasArecord) {
+    // arecord first on Linux: reliable WAV + SIGTERM. ffmpeg next. rec last (often empty on stop).
+    if (hasArecord && process.platform === "linux") {
       cmd = "arecord";
-      args = ["-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", MIC_PATH];
-    } else {
+      args = ["-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", "-q", MIC_PATH];
+    } else if (hasFfmpeg) {
       cmd = "ffmpeg";
       args = process.platform === "darwin"
-        ? ["-f", "avfoundation", "-i", ":0", "-ar", "16000", "-ac", "1", "-y", MIC_PATH]
-        : ["-f", "alsa", "-i", "default", "-ar", "16000", "-ac", "1", "-y", MIC_PATH];
+        ? ["-f", "avfoundation", "-i", ":0", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", MIC_PATH]
+        : process.platform === "linux"
+          ? ["-f", "alsa", "-i", "default", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", MIC_PATH]
+          : ["-f", "dshow", "-i", "audio=default", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", MIC_PATH];
+    } else if (hasArecord) {
+      cmd = "arecord";
+      args = ["-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", "-q", MIC_PATH];
+    } else {
+      cmd = "rec";
+      args = ["-q", "-c", "1", "-r", "16000", "-b", "16", "-e", "signed-integer", "-t", "wav", MIC_PATH];
     }
 
     await mkdir(dirname(MIC_PATH), { recursive: true });
     await unlink(MIC_PATH).catch(() => {});
 
+    recordingCmd = cmd;
     recordingProcess = spawn(cmd, args, { stdio: "ignore" });
     recordingProcess.on("error", () => {
       isRecording = false;
+      recordingCmd = null;
       setMicWidget(ctx, false);
     });
     recordingProcess.on("exit", () => { recordingProcess = null; });
@@ -466,9 +523,9 @@ export default function spacexai(pi: ExtensionAPI) {
   async function cancelRecording(ctx: ExtensionContext, tooLong: boolean): Promise<void> {
     if (!isRecording) return;
     isRecording = false;
-    recordingProcess?.kill("SIGTERM");
-    recordingProcess = null;
     if (recordingTimeout) { clearTimeout(recordingTimeout); recordingTimeout = null; }
+    await stopRecorder();
+    recordingCmd = null;
     setMicWidget(ctx, false);
     await unlink(MIC_PATH).catch(() => {});
     ctx.ui.notify(
@@ -480,22 +537,19 @@ export default function spacexai(pi: ExtensionAPI) {
   }
 
   async function stopRecordingAndSend(ctx: ExtensionContext): Promise<void> {
-    if (!isRecording || !recordingProcess) return;
+    if (!isRecording) return;
 
     isRecording = false;
-    recordingProcess.kill("SIGTERM");
-    recordingProcess = null;
     if (recordingTimeout) { clearTimeout(recordingTimeout); recordingTimeout = null; }
     setMicWidget(ctx, false);
-
-    // Let the recorder flush the WAV header/data.
-    await new Promise((r) => setTimeout(r, 600));
+    await stopRecorder();
+    recordingCmd = null;
 
     let audioBuffer: Buffer;
     try {
-      audioBuffer = await readFile(MIC_PATH);
-    } catch {
-      ctx.ui.notify("Recording failed — no audio captured", "error");
+      audioBuffer = await loadRecordingWav();
+    } catch (error) {
+      ctx.ui.notify(error instanceof Error ? error.message : "Recording failed — no audio captured", "error");
       await unlink(MIC_PATH).catch(() => {});
       return;
     }
@@ -508,7 +562,14 @@ export default function spacexai(pi: ExtensionAPI) {
       form.append("language", config.language ?? "en");
       form.append("file", new Blob([new Uint8Array(audioBuffer)], { type: "audio/wav" }), "recording.wav");
 
-      const data: any = await api(ctx, "/stt", { method: "POST", body: form }).then((r) => r.json());
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(new Error("STT timed out after 60 seconds")), 60_000);
+      let data: any;
+      try {
+        data = await api(ctx, "/stt", { method: "POST", body: form }, controller.signal).then((r) => r.json());
+      } finally {
+        clearTimeout(timeout);
+      }
       const text = typeof data.text === "string" ? data.text.trim() : "";
       if (!text) {
         ctx.ui.notify("No speech detected", "warning");
@@ -518,7 +579,8 @@ export default function spacexai(pi: ExtensionAPI) {
       ctx.ui.notify(`🎤 Heard: "${text}"`, "success");
       pi.sendUserMessage(text);
     } catch (error) {
-      ctx.ui.notify(`Transcription failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Transcription failed: ${/abort|timed out/i.test(message) ? "request timed out after 60 seconds" : message}`, "error");
     } finally {
       await unlink(MIC_PATH).catch(() => {});
     }

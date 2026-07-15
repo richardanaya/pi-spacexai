@@ -1,6 +1,6 @@
 {
   "name": "pi-spacexai",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "SpaceXAI OAuth provider, server-side Grok tools, and full image, video, TTS, and STT tools for pi",
   "license": "MIT",
   "author": "Richard Anaya",

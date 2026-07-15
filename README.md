@@ -73,4 +73,4 @@ F12                      # toggle mic → STT → send (also stops TTS if playin
 
 Playback requires `ffplay` from FFmpeg. TTS text is limited to 15,000 characters. `/set-speaking-style` stores a persistent style description and injects it into the system prompt so responses are written for that delivery; `/remove-speaking-style` clears it. Slash-command configuration is stored at `~/.pi/spacexai.json` with user-only permissions.
 
-Voice input needs a local recorder: **sox** (`rec`, preferred), **arecord** (ALSA), or **ffmpeg**. Transcription uses the same OAuth / `SPACEXAI_API_KEY` auth as the rest of the extension via REST `POST /v1/stt` (file upload). There is no streaming WebSocket STT.
+Voice input needs a local recorder. Preference order: **arecord** (ALSA, Linux), **ffmpeg**, then **sox** (`rec`). Sox is last because some builds leave an empty/invalid WAV when stopped. Capture is re-muxed through ffmpeg when available so STT always sees a valid PCM WAV. Transcription uses the same OAuth / `SPACEXAI_API_KEY` auth via REST `POST /v1/stt`. There is no streaming WebSocket STT.
