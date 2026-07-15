@@ -1,6 +1,6 @@
 # pi-spacexai
 
-Bring the full Grok ecosystem into pi: subscription-backed models, Grok Imagine, speech generation and transcription, and a harness that can speak its responses aloud.
+Bring the full Grok ecosystem into pi: subscription-backed models, Grok Imagine, speech generation and transcription, F12 mic voice input, and a harness that can speak its responses aloud.
 
 ## Why pi-spacexai is cool
 
@@ -29,6 +29,10 @@ Create production-ready speech files with full control over voice, language, spe
 
 Use `/listen` to hear the latest assistant response or `/auto-listen-on` to make pi speak every completed response automatically. Choose a voice and persist a speaking style so the assistant writes naturally for spoken delivery, including supported xAI speech tags when appropriate.
 
+### 5. Talk back with F12 voice input
+
+Press **F12** to start recording from the microphone (widget above the editor). Press **F12** again to stop, transcribe with SpaceXAI STT (`/v1/stt`), and send the transcript as your next user message. If TTS is currently playing, the first F12 stops playback instead. Max recording length is 5 minutes (longer takes are discarded).
+
 ## Load and authenticate
 
 ```bash
@@ -54,11 +58,10 @@ Every `spacexai` Responses API request also exposes xAI's server-side `web_searc
 
 Media inputs accept HTTP(S) URLs, data URIs, Files API IDs, or local paths (an optional leading `@` is stripped). Relative paths resolve from pi's current working directory. Local image/video inputs are encoded as data URIs. Output directories are created automatically. Temporary image/video URLs should be downloaded promptly using `outputPath`.
 
-## Speech slash commands
-
-Existing commands remain available:
+## Speech slash commands and F12 input
 
 ```text
+F12                      # toggle mic → STT → send (also stops TTS if playing)
 /listen
 /listen-stop
 /auto-listen-on
@@ -68,4 +71,6 @@ Existing commands remain available:
 /remove-speaking-style
 ```
 
-Playback requires `ffplay` from FFmpeg. TTS text is limited to 15,000 characters. `/set-speaking-style` stores a persistent style description and injects it into the system prompt so responses are written for that delivery; `/remove-speaking-style` clears it. Slash-command configuration is stored at `~/.pi/spacexai.json` with user-only permissions. This extension intentionally provides file-based REST STT and no WebSocket tools.
+Playback requires `ffplay` from FFmpeg. TTS text is limited to 15,000 characters. `/set-speaking-style` stores a persistent style description and injects it into the system prompt so responses are written for that delivery; `/remove-speaking-style` clears it. Slash-command configuration is stored at `~/.pi/spacexai.json` with user-only permissions.
+
+Voice input needs a local recorder: **sox** (`rec`, preferred), **arecord** (ALSA), or **ffmpeg**. Transcription uses the same OAuth / `SPACEXAI_API_KEY` auth as the rest of the extension via REST `POST /v1/stt` (file upload). There is no streaming WebSocket STT.

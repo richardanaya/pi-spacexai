@@ -4,8 +4,10 @@ import { Type } from "typebox";
 import { homedir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
-import { spawn, type ChildProcess } from "node:child_process";
+import { exec, spawn, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 
+const execAsync = promisify(exec);
 const PROVIDER = "spacexai";
 const API_BASE = "https://api.x.ai/v1";
 const AUTH_BASE = "https://auth.x.ai/oauth2";
@@ -13,6 +15,8 @@ const CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
 const SCOPES = "openid profile email offline_access grok-cli:access api:access";
 const CONFIG_PATH = join(homedir(), ".pi", "spacexai.json");
 const AUDIO_PATH = join(homedir(), ".pi", "spacexai-tts.mp3");
+const MIC_PATH = join(homedir(), ".pi", "spacexai-mic.wav");
+const MAX_RECORDING_MS = 5 * 60 * 1000;
 const EXPIRY_SKEW_MS = 120_000;
 
 interface Config {
@@ -43,6 +47,15 @@ async function readConfig(): Promise<Config> {
 async function saveConfig(config: Config): Promise<void> {
   await mkdir(dirname(CONFIG_PATH), { recursive: true });
   await writeFile(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+}
+
+async function commandExists(cmd: string): Promise<boolean> {
+  try {
+    await execAsync(`which ${cmd}`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function parseError(response: Response): Promise<string> {
@@ -385,5 +398,158 @@ export default function spacexai(pi: ExtensionAPI) {
     catch (error) { ctx.ui.notify(`Auto-listen failed: ${error instanceof Error ? error.message : String(error)}`, "error"); }
   });
 
-  pi.on("session_shutdown", async () => { player?.kill("SIGTERM"); player = undefined; await unlink(AUDIO_PATH).catch(() => {}); });
+  // F12 toggle: stop TTS if playing, else start/stop mic → STT → send (from pi-xai-tts).
+  let isRecording = false;
+  let recordingProcess: ChildProcess | null = null;
+  let recordingTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  function setMicWidget(ctx: ExtensionContext, on: boolean): void {
+    if (!ctx.hasUI) return;
+    ctx.ui.setWidget(
+      "spacexai-mic",
+      on
+        ? [
+            "┌─────────────────────────────────────────────────────────────┐",
+            "│  🎤  Recording…  press F12 to stop & send  (max 5 min)  🎤  │",
+            "└─────────────────────────────────────────────────────────────┘",
+          ]
+        : undefined,
+      { placement: "aboveEditor" },
+    );
+  }
+
+  async function startRecording(ctx: ExtensionContext): Promise<void> {
+    if (isRecording) return;
+
+    const hasRec = await commandExists("rec");
+    const hasArecord = await commandExists("arecord");
+    const hasFfmpeg = await commandExists("ffmpeg");
+    if (!hasRec && !hasArecord && !hasFfmpeg) {
+      ctx.ui.notify("No audio recorder found. Install sox (rec), arecord, or ffmpeg.", "error");
+      return;
+    }
+
+    let cmd: string;
+    let args: string[];
+    if (hasRec) {
+      cmd = "rec";
+      args = ["-q", "-c", "1", "-r", "16000", "-b", "16", "-e", "signed-integer", MIC_PATH];
+    } else if (hasArecord) {
+      cmd = "arecord";
+      args = ["-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", MIC_PATH];
+    } else {
+      cmd = "ffmpeg";
+      args = process.platform === "darwin"
+        ? ["-f", "avfoundation", "-i", ":0", "-ar", "16000", "-ac", "1", "-y", MIC_PATH]
+        : ["-f", "alsa", "-i", "default", "-ar", "16000", "-ac", "1", "-y", MIC_PATH];
+    }
+
+    await mkdir(dirname(MIC_PATH), { recursive: true });
+    await unlink(MIC_PATH).catch(() => {});
+
+    recordingProcess = spawn(cmd, args, { stdio: "ignore" });
+    recordingProcess.on("error", () => {
+      isRecording = false;
+      setMicWidget(ctx, false);
+    });
+    recordingProcess.on("exit", () => { recordingProcess = null; });
+
+    isRecording = true;
+    setMicWidget(ctx, true);
+    ctx.ui.notify("🎤 Recording… press F12 to stop and send (max 5 min)", "info");
+
+    recordingTimeout = setTimeout(() => {
+      if (isRecording) void cancelRecording(ctx, true);
+    }, MAX_RECORDING_MS);
+  }
+
+  async function cancelRecording(ctx: ExtensionContext, tooLong: boolean): Promise<void> {
+    if (!isRecording) return;
+    isRecording = false;
+    recordingProcess?.kill("SIGTERM");
+    recordingProcess = null;
+    if (recordingTimeout) { clearTimeout(recordingTimeout); recordingTimeout = null; }
+    setMicWidget(ctx, false);
+    await unlink(MIC_PATH).catch(() => {});
+    ctx.ui.notify(
+      tooLong
+        ? "Recording stopped — exceeded 5 minute limit. Message discarded. Press F12 to try again."
+        : "Recording cancelled",
+      tooLong ? "warning" : "info",
+    );
+  }
+
+  async function stopRecordingAndSend(ctx: ExtensionContext): Promise<void> {
+    if (!isRecording || !recordingProcess) return;
+
+    isRecording = false;
+    recordingProcess.kill("SIGTERM");
+    recordingProcess = null;
+    if (recordingTimeout) { clearTimeout(recordingTimeout); recordingTimeout = null; }
+    setMicWidget(ctx, false);
+
+    // Let the recorder flush the WAV header/data.
+    await new Promise((r) => setTimeout(r, 600));
+
+    let audioBuffer: Buffer;
+    try {
+      audioBuffer = await readFile(MIC_PATH);
+    } catch {
+      ctx.ui.notify("Recording failed — no audio captured", "error");
+      await unlink(MIC_PATH).catch(() => {});
+      return;
+    }
+
+    try {
+      ctx.ui.notify("Transcribing…", "info");
+      const config = await readConfig();
+      const form = new FormData();
+      form.append("format", "true");
+      form.append("language", config.language ?? "en");
+      form.append("file", new Blob([new Uint8Array(audioBuffer)], { type: "audio/wav" }), "recording.wav");
+
+      const data: any = await api(ctx, "/stt", { method: "POST", body: form }).then((r) => r.json());
+      const text = typeof data.text === "string" ? data.text.trim() : "";
+      if (!text) {
+        ctx.ui.notify("No speech detected", "warning");
+        return;
+      }
+
+      ctx.ui.notify(`🎤 Heard: "${text}"`, "success");
+      pi.sendUserMessage(text);
+    } catch (error) {
+      ctx.ui.notify(`Transcription failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    } finally {
+      await unlink(MIC_PATH).catch(() => {});
+    }
+  }
+
+  pi.registerShortcut("f12", {
+    description: "Toggle voice input (mic → STT → send). Also stops TTS playback.",
+    handler: async (ctx) => {
+      if (!ctx.hasUI) return;
+      if (player) {
+        player.kill("SIGTERM");
+        player = undefined;
+        ctx.ui.notify("Stopped listening", "info");
+        return;
+      }
+      if (isRecording) await stopRecordingAndSend(ctx);
+      else await startRecording(ctx);
+    },
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    if (recordingTimeout) { clearTimeout(recordingTimeout); recordingTimeout = null; }
+    if (isRecording) {
+      isRecording = false;
+      recordingProcess?.kill("SIGTERM");
+      recordingProcess = null;
+      setMicWidget(ctx, false);
+    }
+    player?.kill("SIGTERM");
+    player = undefined;
+    await unlink(AUDIO_PATH).catch(() => {});
+    await unlink(MIC_PATH).catch(() => {});
+  });
 }
