@@ -1,23 +1,21 @@
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { homedir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { exec, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
-const PROVIDER = "spacexai";
+/** Built-in pi provider id for xAI (OAuth subscription or API key). */
+const PROVIDER = "xai";
 const API_BASE = "https://api.x.ai/v1";
-const AUTH_BASE = "https://auth.x.ai/oauth2";
-const CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
-const SCOPES = "openid profile email offline_access grok-cli:access api:access";
+const AUTH_PATH = join(homedir(), ".pi", "agent", "auth.json");
 const CONFIG_PATH = join(homedir(), ".pi", "spacexai.json");
 const AUDIO_PATH = join(homedir(), ".pi", "spacexai-tts.mp3");
 const MIC_PATH = join(homedir(), ".pi", "spacexai-mic.wav");
 const MAX_RECORDING_MS = 5 * 60 * 1000;
-const EXPIRY_SKEW_MS = 120_000;
 
 interface Config {
   voice?: string;
@@ -27,18 +25,31 @@ interface Config {
   speakingStyle?: string;
 }
 
-const MODELS = [
-  { id: "grok-4.5", name: "Grok 4.5", reasoning: true, contextWindow: 500_000, maxTokens: 131_072 },
-  { id: "grok-4.3", name: "Grok 4.3", reasoning: true, contextWindow: 256_000, maxTokens: 65_536 },
-  { id: "grok-build", name: "Grok Build", reasoning: true, contextWindow: 256_000, maxTokens: 65_536 },
-  { id: "grok-build-0.1", name: "Grok Build 0.1", reasoning: true, contextWindow: 256_000, maxTokens: 65_536 },
-  { id: "grok-composer-2.5-fast", name: "Grok Composer 2.5 Fast", reasoning: true, contextWindow: 256_000, maxTokens: 65_536 },
-].map((model) => ({
-  ...model,
-  input: ["text", "image"] as ("text" | "image")[],
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  compat: { supportsReasoningEffort: true, supportsStore: true },
-}));
+interface StoredCredential {
+  type?: string;
+  access?: string;
+  refresh?: string;
+  key?: string;
+  expires?: number;
+}
+
+/** True when pi has xAI OAuth (or API-key) credentials in auth.json. */
+function hasXaiCredentials(): boolean {
+  try {
+    // Sync read at load time: tools only register when auth already exists.
+    const data = JSON.parse(readFileSync(AUTH_PATH, "utf8")) as Record<string, StoredCredential>;
+    const cred = data[PROVIDER];
+    if (!cred) return false;
+    if (cred.type === "oauth" && typeof cred.access === "string" && cred.access.length > 0) return true;
+    if (cred.type === "api_key" && typeof cred.key === "string" && cred.key.length > 0) return true;
+    // Legacy / partial shapes
+    if (typeof cred.access === "string" && cred.access.length > 0) return true;
+    if (typeof cred.key === "string" && cred.key.length > 0) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 async function readConfig(): Promise<Config> {
   try { return JSON.parse(await readFile(CONFIG_PATH, "utf8")) as Config; } catch { return {}; }
@@ -66,76 +77,6 @@ async function parseError(response: Response): Promise<string> {
   } catch { return text; }
 }
 
-async function tokenRequest(body: URLSearchParams): Promise<any> {
-  const response = await fetch(`${AUTH_BASE}/token`, {
-    method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-  const data = await response.json() as any;
-  if (!response.ok) throw new Error(`SpaceXAI token request failed: ${data.error_description ?? data.error ?? response.status}`);
-  return data;
-}
-
-async function login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  const response = await fetch(`${AUTH_BASE}/device/code`, {
-    method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ client_id: CLIENT_ID, scope: SCOPES }),
-  });
-  if (!response.ok) throw new Error(`SpaceXAI device authorization failed: ${await parseError(response)}`);
-  const device = await response.json() as {
-    device_code: string; user_code: string; verification_uri: string;
-    verification_uri_complete?: string; expires_in: number; interval?: number;
-  };
-  callbacks.onAuth({ url: device.verification_uri_complete ?? device.verification_uri });
-  callbacks.onDeviceCode({
-    userCode: device.user_code,
-    verificationUri: device.verification_uri_complete ?? device.verification_uri,
-    intervalSeconds: device.interval ?? 5,
-    expiresInSeconds: device.expires_in,
-  });
-
-  const deadline = Date.now() + device.expires_in * 1000;
-  let interval = device.interval ?? 5;
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, interval * 1000));
-    try {
-      const token = await tokenRequest(new URLSearchParams({
-        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-        device_code: device.device_code,
-        client_id: CLIENT_ID,
-      }));
-      return {
-        access: token.access_token,
-        refresh: token.refresh_token,
-        expires: Date.now() + token.expires_in * 1000 - EXPIRY_SKEW_MS,
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      // xAI sometimes returns the OAuth code and sometimes only a human-readable
-      // description while device authorization is still pending.
-      if (/authorization_pending|not yet authorized|authorization is pending/i.test(message)) continue;
-      if (/slow_down|slow down/i.test(message)) { interval += 5; continue; }
-      throw error;
-    }
-  }
-  throw new Error("SpaceXAI device authorization expired");
-}
-
-async function refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-  const token = await tokenRequest(new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: credentials.refresh,
-    client_id: CLIENT_ID,
-  }));
-  return {
-    access: token.access_token,
-    refresh: token.refresh_token ?? credentials.refresh,
-    expires: Date.now() + token.expires_in * 1000 - EXPIRY_SKEW_MS,
-  };
-}
-
 function assistantText(message: any): string | undefined {
   if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
   const text = message.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n").trim();
@@ -153,9 +94,12 @@ function lastAssistantText(ctx: ExtensionContext): string | undefined {
   }
 }
 
+/** Resolve a live xAI token via pi (refreshes OAuth when needed). */
 async function bearer(ctx: ExtensionContext): Promise<string> {
   const token = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
-  if (!token) throw new Error("Not authenticated. Run /login spacexai or set SPACEXAI_API_KEY.");
+  if (!token) {
+    throw new Error("Not authenticated with xAI. Run /login xai (subscription OAuth or API key).");
+  }
   return token;
 }
 
@@ -246,15 +190,11 @@ async function play(audio: Buffer): Promise<void> {
 }
 
 export default function spacexai(pi: ExtensionAPI) {
-  pi.registerProvider(PROVIDER, {
-    name: "SpaceXAI (Grok subscription)",
-    baseUrl: API_BASE,
-    apiKey: "$SPACEXAI_API_KEY",
-    authHeader: true,
-    api: "openai-responses",
-    models: MODELS,
-    oauth: { name: "SpaceXAI / SuperGrok", login, refreshToken, getApiKey: (credentials) => credentials.access },
-  });
+  // pi now owns the xAI OAuth provider. This extension only layers media/speech UX
+  // on top, and stays inert unless ~/.pi/agent/auth.json already has xai credentials.
+  if (!hasXaiCredentials()) {
+    return;
+  }
 
   // xAI Responses executes these tools server-side. They are distinct from pi's
   // client-side function tools and can coexist in the same request.
@@ -398,7 +338,7 @@ export default function spacexai(pi: ExtensionAPI) {
     catch (error) { ctx.ui.notify(`Auto-listen failed: ${error instanceof Error ? error.message : String(error)}`, "error"); }
   });
 
-  // F12 toggle: stop TTS if playing, else start/stop mic → STT → send (from pi-xai-tts).
+  // F12 toggle: stop TTS if playing, else start/stop mic → STT → send.
   // Prefer arecord/ffmpeg over sox `rec`: sox_ng often writes an empty/invalid WAV on stop.
   let isRecording = false;
   let recordingProcess: ChildProcess | null = null;
