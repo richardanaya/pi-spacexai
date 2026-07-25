@@ -18,7 +18,7 @@ Generate and edit images, or create, edit, and extend videos without leaving the
 
 - Text-to-image and image editing with up to three source images
 - 1–10 image variations, every supported aspect ratio, and 1K/2K resolution
-- Text-to-video, image-to-video, and reference-to-video workflows
+- Image-to-video and reference-to-video workflows (separate tools, matching Grok Build names)
 - Exact video duration control in seconds, aspect ratio, and 480p/720p/1080p resolution
 - Video editing and 2–10 second extensions
 - Automatic job polling, output downloading, and explicit destination paths
@@ -31,9 +31,17 @@ Create production-ready speech files with full control over voice, language, spe
 
 Use `/listen` to hear the latest assistant response or `/auto-listen-on` to make pi speak every completed response automatically. Choose a voice and persist a speaking style so the assistant writes naturally for spoken delivery, including supported xAI speech tags when appropriate.
 
-### 5. Talk back with F12 voice input
+### 5. Talk back with Ctrl+Space push-to-talk
 
-Press **F12** to start recording from the microphone (widget above the editor). Press **F12** again to stop, transcribe with xAI STT (`/v1/stt`), and send the transcript as your next user message. If TTS is currently playing, the first F12 stops playback instead. Max recording length is 5 minutes (longer takes are discarded).
+**Hold Ctrl+Space** to stream microphone audio to xAI realtime STT (`wss://api.x.ai/v1/stt`). While held you get:
+
+- A footer **`● REC`** status (plus a toast) as soon as the mic is live
+- A bottom overlay with a pulsing REC badge, elapsed time, and live captions
+- **Live editor streaming** — interim and final STT text is written into the editor as you speak (appended after any text that was already there)
+
+**Release** to finalize the utterance (stale interim is replaced by the server-final text). Press **Enter** when you are ready to send. **Esc** cancels and restores the editor to its pre-recording contents. If TTS is playing, Ctrl+Space stops playback instead of opening the mic.
+
+Push-to-talk needs a terminal with **Kitty keyboard protocol** key-release events (Kitty, Ghostty, WezTerm, recent iTerm2, etc.). Max hold length is 5 minutes.
 
 ### 6. Server-side Grok tools on xAI models
 
@@ -78,22 +86,23 @@ Select Grok models with `/model` under provider **`xai`** (built into pi).
 
 ## REST media tools
 
-- `spacexai_grok_image_generate`: model, prompt, 1–10 images, every documented aspect ratio, 1k/2k resolution, URL/base64 response, and a required output path.
-- `spacexai_grok_image_edit`: single or up to three source images, all documented edit options, and a required output path.
-- `spacexai_grok_video_generate`: text-, image-, or reference-to-video; model, prompt, duration, aspect ratio, resolution, and a required output path. It polls until completion and downloads the video.
-- `spacexai_grok_video_edit`: prompt/video, documented (service-ignored) geometry fields, and a required output path. It polls until completion.
-- `spacexai_grok_video_extend`: prompt/video, optional 2–10 second extension duration, and a required output path. It polls until completion.
-- `spacexai_grok_video_status`: poll by request ID and download completed video to a required output path.
-- `spacexai_tts`: text/language, voice, speed, codec, sample rate, MP3 bit rate, latency optimization, normalization, timestamps, and a required `outputPath`. The tool only saves audio and does not play it. Timestamp envelopes can be saved separately.
-- `spacexai_stt`: file or URL transcription with raw format/sample rate, language/formatting, multichannel/channels, diarization, repeatable keyterms, and filler-word options.
-- `spacexai_voices`: list available built-in and custom voices.
+- `image_gen`: model, prompt, 1–10 images, every documented aspect ratio, 1k/2k resolution, URL/base64 response, and a required output path.
+- `image_edit`: single or up to three source images, all documented edit options, and a required output path.
+- `image_to_video`: single source image → video (optional prompt, duration, resolution); polls until completion and downloads to a required output path.
+- `reference_to_video`: 2–7 reference images + prompt → video (duration, aspect ratio, resolution); polls until completion and downloads to a required output path.
+- `video_edit`: prompt/video, documented (service-ignored) geometry fields, and a required output path. It polls until completion.
+- `video_extend`: prompt/video, optional 2–10 second extension duration, and a required output path. It polls until completion.
+- `text_to_speech`: text/language, voice, speed, codec, sample rate, MP3 bit rate, latency optimization, normalization, timestamps, and a required `outputPath`. The tool only saves audio and does not play it. Timestamp envelopes can be saved separately.
+- `speech_to_text`: file or URL transcription with raw format/sample rate, language/formatting, multichannel/channels, diarization, repeatable keyterms, and filler-word options.
+- `list_speech_voices`: list available built-in and custom voices.
 
 Media inputs accept HTTP(S) URLs, data URIs, Files API IDs, or local paths (an optional leading `@` is stripped). Relative paths resolve from pi's current working directory. Local image/video inputs are encoded as data URIs. Output directories are created automatically. Temporary image/video URLs should be downloaded promptly using `outputPath`.
 
-## Speech slash commands and F12 input
+## Speech slash commands and Ctrl+Space PTT
 
 ```text
-F12                      # toggle mic → STT → send (also stops TTS if playing)
+Ctrl+Space (hold)        # stream mic → live STT into editor + ● REC footer; release to finalize (also stops TTS if playing)
+Esc                      # cancel push-to-talk and restore the editor
 /listen
 /listen-stop
 /auto-listen-on
@@ -105,4 +114,4 @@ F12                      # toggle mic → STT → send (also stops TTS if playin
 
 Playback requires `ffplay` from FFmpeg. TTS text is limited to 15,000 characters. `/set-speaking-style` stores a persistent style description and injects it into the system prompt so responses are written for that delivery; `/remove-speaking-style` clears it. Slash-command configuration is stored at `~/.pi/spacexai.json` with user-only permissions.
 
-Voice input needs a local recorder. Preference order: **arecord** (ALSA, Linux), **ffmpeg**, then **sox** (`rec`). Sox is last because some builds leave an empty/invalid WAV when stopped. Capture is re-muxed through ffmpeg when available so STT always sees a valid PCM WAV. Transcription uses the same xAI auth via REST `POST /v1/stt`. There is no streaming WebSocket STT.
+Voice input streams raw PCM16 mono @ 16 kHz over `wss://api.x.ai/v1/stt` (`interim_results=true`). On release the client sends `finalize` then `audio.done` and uses the resulting transcript. Local recorder preference: **arecord** (ALSA raw PCM on Linux), then **ffmpeg** (stdout s16le). Auth is the same xAI bearer from pi’s model registry.

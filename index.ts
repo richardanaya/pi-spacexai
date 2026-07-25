@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { isKeyRelease, isKittyProtocolActive, matchesKey, type Component } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
 import { readFileSync } from "node:fs";
@@ -11,11 +12,14 @@ const execAsync = promisify(exec);
 /** Built-in pi provider id for xAI (OAuth subscription or API key). */
 const PROVIDER = "xai";
 const API_BASE = "https://api.x.ai/v1";
+const STT_WS_BASE = "wss://api.x.ai/v1/stt";
 const AUTH_PATH = join(homedir(), ".pi", "agent", "auth.json");
 const CONFIG_PATH = join(homedir(), ".pi", "spacexai.json");
 const AUDIO_PATH = join(homedir(), ".pi", "spacexai-tts.mp3");
-const MIC_PATH = join(homedir(), ".pi", "spacexai-mic.wav");
 const MAX_RECORDING_MS = 5 * 60 * 1000;
+const STT_SAMPLE_RATE = 16_000;
+/** 100 ms of mono PCM16 @ 16 kHz — xAI's recommended streaming chunk size. */
+const STT_CHUNK_BYTES = (STT_SAMPLE_RATE * 2) / 10;
 
 interface Config {
   voice?: string;
@@ -218,21 +222,62 @@ export default function spacexai(pi: ExtensionAPI) {
   const aspectImage = Type.Union(["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20", "auto"].map(Type.Literal));
   const aspectVideo = Type.Union(["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"].map(Type.Literal));
   const imageCommon = { model: Type.String({ description: "grok-imagine-image or grok-imagine-image-quality" }), prompt: Type.String(), aspect_ratio: Type.Optional(aspectImage), resolution: Type.Optional(Type.Union([Type.Literal("1k"), Type.Literal("2k")])), response_format: Type.Optional(Type.Union([Type.Literal("url"), Type.Literal("b64_json")])), outputPath: Type.String({ description: "Required destination filename; numbered when n > 1" }) };
-  pi.registerTool({ name: "spacexai_grok_image_generate", label: "Grok Imagine Image Generation", description: "Grok Imagine: generate images with all REST options.", parameters: Type.Object({ ...imageCommon, n: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })) }), async execute(_id, p, signal, _u, ctx) { const { outputPath, ...body } = p; return imageResult(ctx, await jsonPost(ctx, "/images/generations", body, signal), outputPath, signal); } });
-  pi.registerTool({ name: "spacexai_grok_image_edit", label: "Grok Imagine Image Edit", description: "Grok Imagine: edit one or up to three images. Inputs may be URLs, file IDs, data URIs, or local paths.", parameters: Type.Object({ ...imageCommon, image: Type.Optional(Type.String()), images: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 3 })) }), async execute(_id, p, signal, _u, ctx) { if (!!p.image === !!p.images) throw new Error("Provide exactly one of image or images"); const { outputPath, image, images, ...body } = p; if (image) body.image = { url: await mediaRef(ctx, image), type: "image_url" }; if (images) body.images = await Promise.all(images.map(async (x: string) => ({ url: await mediaRef(ctx, x), type: "image_url" }))); return imageResult(ctx, await jsonPost(ctx, "/images/edits", body, signal), outputPath, signal); } });
+  pi.registerTool({ name: "image_gen", label: "Grok Imagine Image Generation", description: "Grok Imagine: generate images with all REST options.", parameters: Type.Object({ ...imageCommon, n: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })) }), async execute(_id, p, signal, _u, ctx) { const { outputPath, ...body } = p; return imageResult(ctx, await jsonPost(ctx, "/images/generations", body, signal), outputPath, signal); } });
+  pi.registerTool({ name: "image_edit", label: "Grok Imagine Image Edit", description: "Grok Imagine: edit one or up to three images. Inputs may be URLs, file IDs, data URIs, or local paths.", parameters: Type.Object({ ...imageCommon, image: Type.Optional(Type.String()), images: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 3 })) }), async execute(_id, p, signal, _u, ctx) { if (!!p.image === !!p.images) throw new Error("Provide exactly one of image or images"); const { outputPath, image, images, ...body } = p; if (image) body.image = { url: await mediaRef(ctx, image), type: "image_url" }; if (images) body.images = await Promise.all(images.map(async (x: string) => ({ url: await mediaRef(ctx, x), type: "image_url" }))); return imageResult(ctx, await jsonPost(ctx, "/images/edits", body, signal), outputPath, signal); } });
 
   const videoCommon = { model: Type.String({ description: "grok-imagine-video" }), prompt: Type.String(), duration: Type.Optional(Type.Number()), aspect_ratio: Type.Optional(aspectVideo), resolution: Type.Optional(Type.Union([Type.Literal("480p"), Type.Literal("720p"), Type.Literal("1080p")])) };
-  pi.registerTool({ name: "spacexai_grok_video_generate", label: "Grok Imagine Video Generation", description: "Grok Imagine: start text-, image-, or reference-to-video generation. Local media is converted to data URIs.", parameters: Type.Object({ ...videoCommon, duration: Type.Optional(Type.Number({ minimum: 1, maximum: 15 })), image: Type.Optional(Type.String()), reference_images: Type.Optional(Type.Array(Type.String(), { minItems: 1 })), outputPath: Type.String({ description: "Required destination video filename" }) }), async execute(_id, p, signal, _u, ctx) { if (p.image && p.reference_images) throw new Error("image and reference_images cannot be combined"); const { image, reference_images, outputPath, ...body } = p; if (image) body.image = { url: await mediaRef(ctx, image) }; if (reference_images) body.reference_images = await Promise.all(reference_images.map(async (x: string) => ({ url: await mediaRef(ctx, x) }))); const data = await jsonPost(ctx, "/videos/generations", body, signal); return saveVideoJob(ctx, data.request_id, outputPath, signal); } });
-  pi.registerTool({ name: "spacexai_grok_video_edit", label: "Grok Imagine Video Edit", description: "Grok Imagine: edit a video. Geometry options are accepted by REST but ignored by the service.", parameters: Type.Object({ ...videoCommon, video: Type.String(), outputPath: Type.String({ description: "Required destination video filename" }) }), async execute(_id, p, signal, _u, ctx) { const { outputPath, ...body } = p; const data = await jsonPost(ctx, "/videos/edits", { ...body, video: { url: await mediaRef(ctx, p.video) } }, signal); return saveVideoJob(ctx, data.request_id, outputPath, signal); } });
-  pi.registerTool({ name: "spacexai_grok_video_extend", label: "Grok Imagine Video Extension", description: "Grok Imagine: extend a video by 2–10 seconds.", parameters: Type.Object({ model: Type.String({ description: "grok-imagine-video" }), prompt: Type.String(), video: Type.String(), duration: Type.Optional(Type.Number({ minimum: 2, maximum: 10 })), outputPath: Type.String({ description: "Required destination video filename" }) }), async execute(_id, p, signal, _u, ctx) { const { outputPath, ...body } = p; const data = await jsonPost(ctx, "/videos/extensions", { ...body, video: { url: await mediaRef(ctx, p.video) } }, signal); return saveVideoJob(ctx, data.request_id, outputPath, signal); } });
-  pi.registerTool({ name: "spacexai_grok_video_status", label: "Grok Imagine Video Status", description: "Grok Imagine: poll a video job and download completed output to the required outputPath.", parameters: Type.Object({ request_id: Type.String(), outputPath: Type.String({ description: "Required destination video filename" }) }), async execute(_id, p, signal, _u, ctx) { const data: any = await api(ctx, `/videos/${encodeURIComponent(p.request_id)}`, {}, signal).then(r => r.json()); let saved; if (data.status === "done" && p.outputPath && data.video?.url) { saved = localPath(ctx, p.outputPath); await saveRemote(data.video.url, saved, signal); } const text = data.status === "done" ? (saved ? `Video done; saved to ${saved}` : `Video done: ${data.video?.url}`) : data.status === "failed" ? `Video failed: ${data.error?.code ?? "error"}: ${data.error?.message ?? "unknown error"}` : `Video status: ${data.status}`; return { content: [{ type: "text", text }], details: { ...data, saved } }; } });
+  // Split to match grok-build tool names: image_to_video (single source frame) vs reference_to_video (multi-ref).
+  pi.registerTool({
+    name: "image_to_video",
+    label: "Grok Imagine Image-to-Video",
+    description: "Grok Imagine: animate a single source image into a video. The image becomes frame 1. Local media is converted to data URIs.",
+    parameters: Type.Object({
+      model: Type.String({ description: "grok-imagine-video" }),
+      image: Type.String({ description: "Source image to animate (URL, data URI, file ID, or local path)" }),
+      prompt: Type.Optional(Type.String({ description: "Optional animation guidance" })),
+      duration: Type.Optional(Type.Number({ minimum: 1, maximum: 15 })),
+      resolution: Type.Optional(Type.Union([Type.Literal("480p"), Type.Literal("720p"), Type.Literal("1080p")])),
+      outputPath: Type.String({ description: "Required destination video filename" }),
+    }),
+    async execute(_id, p, signal, _u, ctx) {
+      const { image, outputPath, prompt, ...rest } = p;
+      const body: any = { ...rest, prompt: prompt ?? "", image: { url: await mediaRef(ctx, image) } };
+      const data = await jsonPost(ctx, "/videos/generations", body, signal);
+      return saveVideoJob(ctx, data.request_id, outputPath, signal);
+    },
+  });
+  pi.registerTool({
+    name: "reference_to_video",
+    label: "Grok Imagine Reference-to-Video",
+    description: "Grok Imagine: generate a video from multiple reference images guided by a text prompt. Local media is converted to data URIs.",
+    parameters: Type.Object({
+      model: Type.String({ description: "grok-imagine-video" }),
+      prompt: Type.String(),
+      reference_images: Type.Array(Type.String(), { minItems: 2, maxItems: 7 }),
+      duration: Type.Optional(Type.Number({ minimum: 1, maximum: 15 })),
+      aspect_ratio: Type.Optional(aspectVideo),
+      resolution: Type.Optional(Type.Union([Type.Literal("480p"), Type.Literal("720p"), Type.Literal("1080p")])),
+      outputPath: Type.String({ description: "Required destination video filename" }),
+    }),
+    async execute(_id, p, signal, _u, ctx) {
+      const { reference_images, outputPath, ...rest } = p;
+      const body: any = {
+        ...rest,
+        reference_images: await Promise.all(reference_images.map(async (x: string) => ({ url: await mediaRef(ctx, x) }))),
+      };
+      const data = await jsonPost(ctx, "/videos/generations", body, signal);
+      return saveVideoJob(ctx, data.request_id, outputPath, signal);
+    },
+  });
+  pi.registerTool({ name: "video_edit", label: "Grok Imagine Video Edit", description: "Grok Imagine: edit a video. Geometry options are accepted by REST but ignored by the service.", parameters: Type.Object({ ...videoCommon, video: Type.String(), outputPath: Type.String({ description: "Required destination video filename" }) }), async execute(_id, p, signal, _u, ctx) { const { outputPath, ...body } = p; const data = await jsonPost(ctx, "/videos/edits", { ...body, video: { url: await mediaRef(ctx, p.video) } }, signal); return saveVideoJob(ctx, data.request_id, outputPath, signal); } });
+  pi.registerTool({ name: "video_extend", label: "Grok Imagine Video Extension", description: "Grok Imagine: extend a video by 2–10 seconds.", parameters: Type.Object({ model: Type.String({ description: "grok-imagine-video" }), prompt: Type.String(), video: Type.String(), duration: Type.Optional(Type.Number({ minimum: 2, maximum: 10 })), outputPath: Type.String({ description: "Required destination video filename" }) }), async execute(_id, p, signal, _u, ctx) { const { outputPath, ...body } = p; const data = await jsonPost(ctx, "/videos/extensions", { ...body, video: { url: await mediaRef(ctx, p.video) } }, signal); return saveVideoJob(ctx, data.request_id, outputPath, signal); } });
 
   pi.registerTool({
-    name: "spacexai_tts",
-    label: "SpaceXAI TTS",
+    name: "text_to_speech",
+    label: "Text to Speech",
     description: "Synthesize speech with every REST option and save it to the required outputPath. This tool does not play audio.",
-    promptSnippet: "Synthesize speech with SpaceXAI TTS",
-    promptGuidelines: ["Use spacexai_tts when the user asks to speak, narrate, or synthesize text with SpaceXAI."],
+    promptSnippet: "Synthesize speech with text_to_speech",
+    promptGuidelines: ["Use text_to_speech when the user asks to speak, narrate, or synthesize text."],
     parameters: Type.Object({ text: Type.String({ maxLength: 15000 }), language: Type.String({ description: "BCP-47 code or auto" }), voice_id: Type.Optional(Type.String()), speed: Type.Optional(Type.Number({ minimum: 0.7, maximum: 1.5 })), codec: Type.Optional(Type.Union(["mp3", "wav", "pcm", "mulaw", "alaw"].map(Type.Literal))), sample_rate: Type.Optional(Type.Union([8000, 16000, 22050, 24000, 44100, 48000].map(Type.Literal))), bit_rate: Type.Optional(Type.Union([32000, 64000, 96000, 128000, 192000].map(Type.Literal))), optimize_streaming_latency: Type.Optional(Type.Union([0, 1, 2].map(Type.Literal))), text_normalization: Type.Optional(Type.Boolean()), with_timestamps: Type.Optional(Type.Boolean()), outputPath: Type.String({ description: "Required audio destination path, including filename" }), timestampsPath: Type.Optional(Type.String({ description: "Save the timestamp JSON envelope here" })) }),
     async execute(_id, p, signal, _update, ctx) {
       const { outputPath, timestampsPath, codec, sample_rate, bit_rate, ...fields } = p;
@@ -248,13 +293,13 @@ export default function spacexai(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({ name: "spacexai_stt", label: "SpaceXAI File STT", description: "Transcribe a local audio file or URL with every documented multipart REST option.", parameters: Type.Object({ file: Type.Optional(Type.String()), url: Type.Optional(Type.String()), audio_format: Type.Optional(Type.Union(["pcm", "mulaw", "alaw"].map(Type.Literal))), sample_rate: Type.Optional(Type.Integer()), language: Type.Optional(Type.String()), format: Type.Optional(Type.Boolean()), multichannel: Type.Optional(Type.Boolean()), channels: Type.Optional(Type.Integer({ minimum: 2, maximum: 8 })), diarize: Type.Optional(Type.Boolean()), keyterm: Type.Optional(Type.Array(Type.String({ maxLength: 50 }), { maxItems: 100 })), filler_words: Type.Optional(Type.Boolean()), outputPath: Type.Optional(Type.String({ description: "Save full transcript JSON" })) }), async execute(_id, p, signal, _u, ctx) { if (!!p.file === !!p.url) throw new Error("Provide exactly one of file or url"); const form = new FormData(); for (const [key, value] of Object.entries(p)) { if (key === "file" || key === "outputPath" || value === undefined) continue; if (key === "keyterm") for (const term of value as string[]) form.append("keyterm", term); else form.append(key, String(value)); } if (p.file) { const path = localPath(ctx, p.file); const bytes = await readFile(path); form.append("file", new Blob([bytes], { type: MIME[extname(path).toLowerCase()] ?? "application/octet-stream" }), path.slice(path.lastIndexOf("/") + 1)); } const data: any = await api(ctx, "/stt", { method: "POST", body: form }, signal).then(r => r.json()); let saved; if (p.outputPath) { saved = localPath(ctx, p.outputPath); await mkdir(dirname(saved), { recursive: true }); await writeFile(saved, JSON.stringify(data, null, 2)); } return { content: [{ type: "text", text: `${data.text ?? "Transcription complete"}${saved ? `\nSaved full result to ${saved}` : ""}` }], details: { ...data, saved } }; } });
+  pi.registerTool({ name: "speech_to_text", label: "Speech to Text", description: "Transcribe a local audio file or URL with every documented multipart REST option.", parameters: Type.Object({ file: Type.Optional(Type.String()), url: Type.Optional(Type.String()), audio_format: Type.Optional(Type.Union(["pcm", "mulaw", "alaw"].map(Type.Literal))), sample_rate: Type.Optional(Type.Integer()), language: Type.Optional(Type.String()), format: Type.Optional(Type.Boolean()), multichannel: Type.Optional(Type.Boolean()), channels: Type.Optional(Type.Integer({ minimum: 2, maximum: 8 })), diarize: Type.Optional(Type.Boolean()), keyterm: Type.Optional(Type.Array(Type.String({ maxLength: 50 }), { maxItems: 100 })), filler_words: Type.Optional(Type.Boolean()), outputPath: Type.Optional(Type.String({ description: "Save full transcript JSON" })) }), async execute(_id, p, signal, _u, ctx) { if (!!p.file === !!p.url) throw new Error("Provide exactly one of file or url"); const form = new FormData(); for (const [key, value] of Object.entries(p)) { if (key === "file" || key === "outputPath" || value === undefined) continue; if (key === "keyterm") for (const term of value as string[]) form.append("keyterm", term); else form.append(key, String(value)); } if (p.file) { const path = localPath(ctx, p.file); const bytes = await readFile(path); form.append("file", new Blob([bytes], { type: MIME[extname(path).toLowerCase()] ?? "application/octet-stream" }), path.slice(path.lastIndexOf("/") + 1)); } const data: any = await api(ctx, "/stt", { method: "POST", body: form }, signal).then(r => r.json()); let saved; if (p.outputPath) { saved = localPath(ctx, p.outputPath); await mkdir(dirname(saved), { recursive: true }); await writeFile(saved, JSON.stringify(data, null, 2)); } return { content: [{ type: "text", text: `${data.text ?? "Transcription complete"}${saved ? `\nSaved full result to ${saved}` : ""}` }], details: { ...data, saved } }; } });
 
   pi.registerTool({
-    name: "spacexai_voices",
-    label: "SpaceXAI Voices",
-    description: "List voices available from SpaceXAI/xAI TTS.",
-    promptSnippet: "List available SpaceXAI TTS voices",
+    name: "list_speech_voices",
+    label: "List Speech Voices",
+    description: "List voices available for text-to-speech.",
+    promptSnippet: "List available speech voices",
     parameters: Type.Object({}),
     async execute(_id, _params, signal, _update, ctx) {
       const response = await fetch(`${API_BASE}/tts/voices`, { headers: { Authorization: `Bearer ${await bearer(ctx)}` }, signal });
@@ -338,27 +383,23 @@ export default function spacexai(pi: ExtensionAPI) {
     catch (error) { ctx.ui.notify(`Auto-listen failed: ${error instanceof Error ? error.message : String(error)}`, "error"); }
   });
 
-  // F12 toggle: stop TTS if playing, else start/stop mic → STT → send.
-  // Prefer arecord/ffmpeg over sox `rec`: sox_ng often writes an empty/invalid WAV on stop.
-  let isRecording = false;
-  let recordingProcess: ChildProcess | null = null;
-  let recordingCmd: string | null = null;
-  let recordingTimeout: ReturnType<typeof setTimeout> | null = null;
-  const MIC_FIXED_PATH = join(homedir(), ".pi", "spacexai-mic-fixed.wav");
+  // Ctrl+Space push-to-talk: hold to stream mic → wss://api.x.ai/v1/stt, release to insert into editor.
+  // Requires Kitty keyboard protocol (key-release events). No toggle fallback.
+  let pttBusy = false;
+  let pttRecorder: ChildProcess | null = null;
+  let pttWs: WebSocket | null = null;
+  let pttTimeout: ReturnType<typeof setTimeout> | null = null;
+  const PTT_STATUS_KEY = "spacexai-ptt";
 
-  function setMicWidget(ctx: ExtensionContext, on: boolean): void {
+  function setPttStatus(ctx: ExtensionContext, label: string | undefined): void {
     if (!ctx.hasUI) return;
-    ctx.ui.setWidget(
-      "spacexai-mic",
-      on
-        ? [
-            "┌─────────────────────────────────────────────────────────────┐",
-            "│  🎤  Recording…  press F12 to stop & send  (max 5 min)  🎤  │",
-            "└─────────────────────────────────────────────────────────────┘",
-          ]
-        : undefined,
-      { placement: "aboveEditor" },
-    );
+    if (!label) {
+      ctx.ui.setStatus(PTT_STATUS_KEY, undefined);
+      return;
+    }
+    const theme = ctx.ui.theme;
+    // Bright error red so "recording" is unmistakable in the footer.
+    ctx.ui.setStatus(PTT_STATUS_KEY, theme.fg("error", label));
   }
 
   function waitForExit(proc: ChildProcess, ms: number): Promise<void> {
@@ -369,165 +410,610 @@ export default function spacexai(pi: ExtensionAPI) {
     });
   }
 
-  async function stopRecorder(): Promise<void> {
-    const proc = recordingProcess;
-    recordingProcess = null;
+  async function stopPttRecorder(): Promise<void> {
+    const proc = pttRecorder;
+    pttRecorder = null;
     if (!proc || proc.exitCode !== null) return;
-    // ffmpeg finalizes the WAV on SIGINT; SIGTERM is fine for arecord.
-    const signal = recordingCmd === "ffmpeg" ? "SIGINT" : "SIGTERM";
-    try { proc.kill(signal); } catch { /* already gone */ }
-    await waitForExit(proc, 1500);
+    try { proc.kill("SIGTERM"); } catch { /* already gone */ }
+    await waitForExit(proc, 800);
     if (proc.exitCode === null) {
       try { proc.kill("SIGKILL"); } catch { /* ignore */ }
-      await waitForExit(proc, 500);
+      await waitForExit(proc, 300);
     }
   }
 
-  /** Ensure a non-empty PCM WAV; re-mux via ffmpeg when available. */
-  async function loadRecordingWav(): Promise<Buffer> {
-    let audioBuffer = await readFile(MIC_PATH);
-    // Empty sox header-only files are ~44 bytes and break STT format sniffing.
-    if (audioBuffer.length < 1024 || audioBuffer.subarray(0, 4).toString("ascii") !== "RIFF") {
-      throw new Error(`Recording failed — no usable audio captured (${audioBuffer.length} bytes)`);
-    }
-    if (await commandExists("ffmpeg")) {
-      try {
-        await execAsync(
-          `ffmpeg -y -hide_banner -loglevel error -i ${JSON.stringify(MIC_PATH)} -ar 16000 -ac 1 -c:a pcm_s16le ${JSON.stringify(MIC_FIXED_PATH)}`,
-          { timeout: 15_000 },
-        );
-        const fixed = await readFile(MIC_FIXED_PATH);
-        if (fixed.length >= 1024) audioBuffer = fixed;
-      } catch {
-        // Keep original capture if re-mux fails.
-      } finally {
-        await unlink(MIC_FIXED_PATH).catch(() => {});
-      }
-    }
-    return audioBuffer;
-  }
-
-  async function startRecording(ctx: ExtensionContext): Promise<void> {
-    if (isRecording) return;
-
-    const hasArecord = await commandExists("arecord");
-    const hasFfmpeg = await commandExists("ffmpeg");
-    const hasRec = await commandExists("rec");
-    if (!hasArecord && !hasFfmpeg && !hasRec) {
-      ctx.ui.notify("No audio recorder found. Install arecord, ffmpeg, or sox (rec).", "error");
-      return;
-    }
-
-    let cmd: string;
-    let args: string[];
-    // arecord first on Linux: reliable WAV + SIGTERM. ffmpeg next. rec last (often empty on stop).
-    if (hasArecord && process.platform === "linux") {
-      cmd = "arecord";
-      args = ["-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", "-q", MIC_PATH];
-    } else if (hasFfmpeg) {
-      cmd = "ffmpeg";
-      args = process.platform === "darwin"
-        ? ["-f", "avfoundation", "-i", ":0", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", MIC_PATH]
-        : process.platform === "linux"
-          ? ["-f", "alsa", "-i", "default", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", MIC_PATH]
-          : ["-f", "dshow", "-i", "audio=default", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", MIC_PATH];
-    } else if (hasArecord) {
-      cmd = "arecord";
-      args = ["-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", "-q", MIC_PATH];
-    } else {
-      cmd = "rec";
-      args = ["-q", "-c", "1", "-r", "16000", "-b", "16", "-e", "signed-integer", "-t", "wav", MIC_PATH];
-    }
-
-    await mkdir(dirname(MIC_PATH), { recursive: true });
-    await unlink(MIC_PATH).catch(() => {});
-
-    recordingCmd = cmd;
-    recordingProcess = spawn(cmd, args, { stdio: "ignore" });
-    recordingProcess.on("error", () => {
-      isRecording = false;
-      recordingCmd = null;
-      setMicWidget(ctx, false);
-    });
-    recordingProcess.on("exit", () => { recordingProcess = null; });
-
-    isRecording = true;
-    setMicWidget(ctx, true);
-    ctx.ui.notify("🎤 Recording… press F12 to stop and send (max 5 min)", "info");
-
-    recordingTimeout = setTimeout(() => {
-      if (isRecording) void cancelRecording(ctx, true);
-    }, MAX_RECORDING_MS);
-  }
-
-  async function cancelRecording(ctx: ExtensionContext, tooLong: boolean): Promise<void> {
-    if (!isRecording) return;
-    isRecording = false;
-    if (recordingTimeout) { clearTimeout(recordingTimeout); recordingTimeout = null; }
-    await stopRecorder();
-    recordingCmd = null;
-    setMicWidget(ctx, false);
-    await unlink(MIC_PATH).catch(() => {});
-    ctx.ui.notify(
-      tooLong
-        ? "Recording stopped — exceeded 5 minute limit. Message discarded. Press F12 to try again."
-        : "Recording cancelled",
-      tooLong ? "warning" : "info",
+  function isSpaceKeyRelease(data: string): boolean {
+    if (!isKeyRelease(data)) return false;
+    // Release may arrive as space, ctrl+space, or other modifier+space depending on release order.
+    return (
+      matchesKey(data, "space") ||
+      matchesKey(data, "ctrl+space") ||
+      matchesKey(data, "shift+space") ||
+      matchesKey(data, "ctrl+shift+space") ||
+      matchesKey(data, "alt+space")
     );
   }
 
-  async function stopRecordingAndSend(ctx: ExtensionContext): Promise<void> {
-    if (!isRecording) return;
+  function buildSttWsUrl(language: string): string {
+    const url = new URL(STT_WS_BASE);
+    url.searchParams.set("sample_rate", String(STT_SAMPLE_RATE));
+    url.searchParams.set("encoding", "pcm");
+    url.searchParams.set("interim_results", "true");
+    url.searchParams.set("language", language);
+    // PTT finalizes explicitly on release; keep endpointing short for chunk finals while held.
+    url.searchParams.set("endpointing", "300");
+    return url.toString();
+  }
 
-    isRecording = false;
-    if (recordingTimeout) { clearTimeout(recordingTimeout); recordingTimeout = null; }
-    setMicWidget(ctx, false);
-    await stopRecorder();
-    recordingCmd = null;
+  async function pickPcmRecorder(): Promise<{ cmd: string; args: string[] } | null> {
+    const hasArecord = await commandExists("arecord");
+    const hasFfmpeg = await commandExists("ffmpeg");
+    // Raw PCM to stdout — no container headers. arecord first on Linux; ffmpeg elsewhere.
+    if (hasArecord && process.platform === "linux") {
+      return {
+        cmd: "arecord",
+        args: ["-f", "S16_LE", "-r", String(STT_SAMPLE_RATE), "-c", "1", "-t", "raw", "-q", "-"],
+      };
+    }
+    if (hasFfmpeg) {
+      const input =
+        process.platform === "darwin"
+          ? ["-f", "avfoundation", "-i", ":0"]
+          : process.platform === "linux"
+            ? ["-f", "alsa", "-i", "default"]
+            : ["-f", "dshow", "-i", "audio=default"];
+      return {
+        cmd: "ffmpeg",
+        args: [
+          ...input,
+          "-ar", String(STT_SAMPLE_RATE),
+          "-ac", "1",
+          "-f", "s16le",
+          "-acodec", "pcm_s16le",
+          "-loglevel", "error",
+          "pipe:1",
+        ],
+      };
+    }
+    if (hasArecord) {
+      return {
+        cmd: "arecord",
+        args: ["-f", "S16_LE", "-r", String(STT_SAMPLE_RATE), "-c", "1", "-t", "raw", "-q", "-"],
+      };
+    }
+    return null;
+  }
 
-    let audioBuffer: Buffer;
-    try {
-      audioBuffer = await loadRecordingWav();
-    } catch (error) {
-      ctx.ui.notify(error instanceof Error ? error.message : "Recording failed — no audio captured", "error");
-      await unlink(MIC_PATH).catch(() => {});
+  function openSttSocket(
+    token: string,
+    language: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<WebSocket> {
+    return new Promise((resolve, reject) => {
+      if (opts?.signal?.aborted) {
+        reject(new Error("Cancelled"));
+        return;
+      }
+      const ws = new WebSocket(buildSttWsUrl(language), {
+        headers: { Authorization: `Bearer ${token}` },
+      } as any);
+
+      const timer = setTimeout(() => {
+        cleanup();
+        try { ws.close(); } catch { /* ignore */ }
+        reject(new Error("STT WebSocket timed out waiting for transcript.created"));
+      }, 15_000);
+
+      const onAbort = () => {
+        cleanup();
+        try { ws.close(); } catch { /* ignore */ }
+        reject(new Error("Cancelled"));
+      };
+
+      const onError = (err: Event) => {
+        cleanup();
+        reject(err instanceof ErrorEvent && err.message ? new Error(err.message) : new Error("STT WebSocket connection failed"));
+      };
+
+      const onMessage = (event: MessageEvent) => {
+        try {
+          const msg = JSON.parse(String(event.data)) as { type?: string; message?: string };
+          if (msg.type === "transcript.created") {
+            cleanup();
+            resolve(ws);
+            return;
+          }
+          if (msg.type === "error") {
+            cleanup();
+            try { ws.close(); } catch { /* ignore */ }
+            reject(new Error(msg.message ?? "STT WebSocket error during handshake"));
+          }
+        } catch {
+          // ignore non-JSON during handshake
+        }
+      };
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        opts?.signal?.removeEventListener("abort", onAbort);
+        ws.removeEventListener("error", onError);
+        ws.removeEventListener("message", onMessage);
+      };
+
+      opts?.signal?.addEventListener("abort", onAbort, { once: true });
+      ws.addEventListener("error", onError);
+      ws.addEventListener("message", onMessage);
+    });
+  }
+
+  type PttOutcome = "stop" | "cancel" | "timeout";
+
+  interface LiveTranscript {
+    /** Completed utterances (each speech_final). Never wiped mid-hold. */
+    committed: string[];
+    /** Best locked text for the open utterance (from chunk finals). */
+    currentFinal: string;
+    /** Unstable partial for the open utterance. */
+    interim: string;
+    status: string;
+    /** True once the mic process is up and PCM is flowing (or ready). */
+    recording: boolean;
+    /** ms epoch when recording became live; used for elapsed + pulse. */
+    recordingStartedAt?: number;
+    doneText?: string;
+  }
+
+  /** Merge two hypotheses for the same open utterance (cumulative vs append). */
+  function mergeUtterance(prev: string, next: string): string {
+    const p = prev.trim();
+    const n = next.trim();
+    if (!p) return n;
+    if (!n) return p;
+    if (p === n) return p;
+    // Server sent a longer cumulative transcript for this utterance.
+    if (n.startsWith(p)) return n;
+    if (p.startsWith(n)) return p;
+    if (n.includes(p) && n.length >= p.length) return n;
+    if (p.includes(n) && p.length >= n.length) return p;
+    // Overlap: end of prev matches start of next (chunk boundaries).
+    const max = Math.min(p.length, n.length);
+    for (let i = max; i >= 8; i--) {
+      if (p.slice(-i) === n.slice(0, i)) return `${p}${n.slice(i)}`.replace(/\s+/g, " ").trim();
+    }
+    // Word-boundary overlap
+    const pWords = p.split(/\s+/);
+    const nWords = n.split(/\s+/);
+    for (let k = Math.min(pWords.length, nWords.length); k >= 1; k--) {
+      if (pWords.slice(-k).join(" ") === nWords.slice(0, k).join(" ")) {
+        return [...pWords, ...nWords.slice(k)].join(" ");
+      }
+    }
+    return `${p} ${n}`;
+  }
+
+  function openUtteranceText(live: LiveTranscript): string {
+    return mergeUtterance(live.currentFinal, live.interim);
+  }
+
+  function liveDisplayText(live: LiveTranscript): string {
+    // Non-empty doneText wins; empty string is treated as "not set" because the
+    // STT server often sends transcript.done with text:"".
+    const done = (live.doneText ?? "").trim();
+    if (done) return done;
+    const parts = [...live.committed];
+    const open = openUtteranceText(live);
+    if (open) parts.push(open);
+    return parts.join(" ").replace(/\s+/g, " ").trim();
+  }
+
+  // ANSI-aware width helpers so theme.fg() styling doesn't break the overlay box.
+  const ANSI_RE = /\[[0-9;]*m/g;
+  function stripAnsi(s: string): string {
+    return s.replace(ANSI_RE, "");
+  }
+  function visibleLen(s: string): number {
+    return stripAnsi(s).length;
+  }
+  /** Clip/pad to `cols` visible characters, preserving ANSI SGR codes. */
+  function clipVisible(s: string, cols: number): string {
+    if (cols <= 0) return "";
+    const plain = stripAnsi(s);
+    if (plain.length <= cols) {
+      return s + " ".repeat(cols - plain.length);
+    }
+    // Take a suffix of the plain text, then rebuild with a leading ellipsis.
+    // For styled preview we re-apply isn't perfect for mid-string codes; callers
+    // should pass already-themed full lines (color wraps whole clipped segment).
+    const keep = Math.max(0, cols - 1);
+    const sliced = plain.slice(-keep);
+    // Prefer returning themed ellipsis+suffix when input was a single color wrap:
+    // detect if s is color+plain+reset by comparing strip.
+    return `…${sliced}`;
+  }
+
+  function createPttOverlay(
+    tui: { requestRender: () => void },
+    theme: { fg: (color: string, text: string) => string },
+    live: LiveTranscript,
+    done: (value: PttOutcome) => void,
+  ): Component {
+    let finished = false;
+    const finish = (value: PttOutcome) => {
+      if (finished) return;
+      finished = true;
+      done(value);
+    };
+
+    return {
+      wantsKeyRelease: true,
+      invalidate() {},
+      handleInput(data: string) {
+        if (matchesKey(data, "escape")) {
+          finish("cancel");
+          return;
+        }
+        if (isSpaceKeyRelease(data)) {
+          finish("stop");
+        }
+      },
+      render(width: number) {
+        const inner = Math.max(24, Math.min(width - 4, width - 4));
+        const bar = "─".repeat(Math.max(0, Math.min(inner + 2, width - 2)));
+
+        // Pulse the REC dot ~2 Hz while the mic is live so it's obvious recording started.
+        const pulseOn = !live.recording || Math.floor(Date.now() / 500) % 2 === 0;
+        const recDot = live.recording ? (pulseOn ? "●" : "○") : "○";
+        const elapsedSec =
+          live.recording && live.recordingStartedAt
+            ? Math.max(0, Math.floor((Date.now() - live.recordingStartedAt) / 1000))
+            : 0;
+        const elapsed =
+          live.recording
+            ? ` ${String(Math.floor(elapsedSec / 60)).padStart(2, "0")}:${String(elapsedSec % 60).padStart(2, "0")}`
+            : "";
+        const recPlain = live.recording ? `${recDot} REC${elapsed}` : `${recDot} …`;
+        const recBadge = live.recording
+          ? theme.fg("error", recPlain)
+          : theme.fg("dim", recPlain);
+        const sep = theme.fg("dim", " · ");
+        const header =
+          `🎤 ${recBadge}` +
+          sep +
+          theme.fg("muted", "release Ctrl+Space to insert") +
+          sep +
+          theme.fg("muted", "Esc cancel") +
+          (live.status ? sep + theme.fg("dim", live.status) : "");
+
+        // Live caption — readable text color; REC badge already signals "in progress".
+        const text = liveDisplayText(live);
+        const bodyPlainFull =
+          text || (live.recording ? "(listening…)" : "");
+        const bodyWindow =
+          bodyPlainFull.length <= inner
+            ? bodyPlainFull
+            : `…${bodyPlainFull.slice(-(inner - 1))}`;
+        const bodyClipped =
+          theme.fg("text", bodyWindow) +
+          " ".repeat(Math.max(0, inner - bodyWindow.length));
+
+        // Clip header by visible width; re-theme overflow so ANSI doesn't break columns.
+        const headerPlain = stripAnsi(header);
+        const headerClipped =
+          headerPlain.length <= inner
+            ? header + " ".repeat(inner - headerPlain.length)
+            : theme.fg("muted", `…${headerPlain.slice(-(inner - 1))}`);
+
+        const border = (s: string) => theme.fg("borderAccent", s);
+        const lines = [
+          border(`┌${bar}┐`),
+          `${border("│")} ${headerClipped} ${border("│")}`,
+          `${border("│")} ${bodyClipped} ${border("│")}`,
+          border(`└${bar}┘`),
+        ];
+        return lines.map((line) => {
+          // Safety: if terminal is narrower than expected, trim by visible width.
+          if (visibleLen(line) <= width) return line;
+          return clipVisible(line, width);
+        });
+      },
+    };
+  }
+
+  async function runPushToTalk(ctx: ExtensionContext): Promise<void> {
+    if (pttBusy || !ctx.hasUI) return;
+    if (ctx.mode !== "tui") {
+      ctx.ui.notify("Push-to-talk requires the interactive TUI.", "warning");
+      return;
+    }
+    if (!isKittyProtocolActive()) {
+      ctx.ui.notify(
+        "Push-to-talk needs Kitty keyboard key-release support. Use a Kitty-protocol terminal (Kitty, Ghostty, WezTerm, recent iTerm2, etc.).",
+        "error",
+      );
       return;
     }
 
-    try {
-      ctx.ui.notify("Transcribing…", "info");
-      const config = await readConfig();
-      const form = new FormData();
-      form.append("format", "true");
-      form.append("language", config.language ?? "en");
-      form.append("file", new Blob([new Uint8Array(audioBuffer)], { type: "audio/wav" }), "recording.wav");
+    const recorderSpec = await pickPcmRecorder();
+    if (!recorderSpec) {
+      ctx.ui.notify("No audio recorder found. Install arecord or ffmpeg.", "error");
+      return;
+    }
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(new Error("STT timed out after 60 seconds")), 60_000);
-      let data: any;
-      try {
-        data = await api(ctx, "/stt", { method: "POST", body: form }, controller.signal).then((r) => r.json());
-      } finally {
-        clearTimeout(timeout);
-      }
-      const text = typeof data.text === "string" ? data.text.trim() : "";
-      if (!text) {
-        ctx.ui.notify("No speech detected", "warning");
+    pttBusy = true;
+    const live: LiveTranscript = {
+      committed: [],
+      currentFinal: "",
+      interim: "",
+      status: "",
+      recording: false,
+    };
+    let closeOverlay: ((value: PttOutcome) => void) | undefined;
+    let renderTimer: ReturnType<typeof setInterval> | undefined;
+    let bytesSent = 0;
+    let pcmBuf = Buffer.alloc(0);
+    let ws: WebSocket | undefined;
+    let markedRecording = false;
+    // Snapshot editor so we can stream live transcript in-place and restore on cancel.
+    const editorBase = (ctx.ui.getEditorText?.() ?? "").trimEnd();
+    let lastEditorPush = "";
+
+    const pushLiveToEditor = () => {
+      const spoken = liveDisplayText(live);
+      const next = spoken
+        ? (editorBase ? `${editorBase} ${spoken}` : spoken)
+        : editorBase;
+      if (next === lastEditorPush) return;
+      lastEditorPush = next;
+      try { ctx.ui.setEditorText(next); } catch { /* editor may be unavailable mid-teardown */ }
+    };
+
+    const restoreEditor = () => {
+      if (lastEditorPush === "") return;
+      try { ctx.ui.setEditorText(editorBase); } catch { /* ignore */ }
+      lastEditorPush = editorBase;
+    };
+
+    const markRecordingLive = () => {
+      if (markedRecording) return;
+      markedRecording = true;
+      live.recording = true;
+      live.recordingStartedAt = Date.now();
+      live.status = "recording";
+      setPttStatus(ctx, "● REC");
+    };
+
+    const cleanupUi = () => {
+      if (renderTimer) { clearInterval(renderTimer); renderTimer = undefined; }
+      if (pttTimeout) { clearTimeout(pttTimeout); pttTimeout = null; }
+      setPttStatus(ctx, undefined);
+    };
+
+    try {
+      const token = await bearer(ctx);
+      const config = await readConfig();
+      const language = config.language ?? "en";
+
+      // Open PTT overlay first so Kitty key-release events are delivered to a focused component.
+      const overlayDone = ctx.ui.custom<PttOutcome>((tui, theme, _kb, done) => {
+        closeOverlay = (value) => {
+          cleanupUi();
+          done(value);
+        };
+        const component = createPttOverlay(tui, theme, live, (value) => closeOverlay?.(value));
+        renderTimer = setInterval(() => tui.requestRender(), 100);
+        return component;
+      }, { overlay: true, overlayOptions: { anchor: "bottom", width: "100%", height: 4, margin: 0 } });
+
+      pttTimeout = setTimeout(() => closeOverlay?.("timeout"), MAX_RECORDING_MS);
+
+      live.status = "";
+      setPttStatus(ctx, undefined);
+      // User may release/cancel while the socket is still handshaking.
+      const connectAbort = new AbortController();
+      type ConnectRace =
+        | { kind: "ws"; socket: WebSocket }
+        | { kind: "outcome"; outcome: PttOutcome };
+      const raced: ConnectRace = await Promise.race([
+        openSttSocket(token, language, { signal: connectAbort.signal }).then((socket) => ({ kind: "ws" as const, socket })),
+        overlayDone.then((outcome) => {
+          connectAbort.abort();
+          return { kind: "outcome" as const, outcome: (outcome ?? "cancel") as PttOutcome };
+        }),
+      ]);
+      if (raced.kind === "outcome") {
+        cleanupUi();
+        restoreEditor();
+        ctx.ui.notify(
+          raced.outcome === "timeout"
+            ? "Recording stopped — exceeded 5 minute limit. Message discarded."
+            : raced.outcome === "cancel"
+              ? "Recording cancelled"
+              : "Released before STT connected — try holding a moment longer",
+          raced.outcome === "timeout" ? "warning" : "info",
+        );
         return;
       }
 
-      ctx.ui.notify(`🎤 Heard: "${text}"`, "success");
-      pi.sendUserMessage(text);
+      ws = raced.socket;
+      pttWs = ws;
+      live.status = "starting mic…";
+      setPttStatus(ctx, "○ starting mic…");
+
+      const onWsMessage = (event: MessageEvent) => {
+        try {
+          const msg = JSON.parse(String(event.data)) as {
+            type?: string;
+            text?: string;
+            is_final?: boolean;
+            speech_final?: boolean;
+            message?: string;
+          };
+          if (msg.type === "transcript.partial") {
+            const text = (msg.text ?? "").trim();
+            if (msg.is_final) {
+              // speech_final = end of utterance (silence / endpointing). Text is THAT
+              // utterance only — commit it and keep prior committed utterances.
+              // Previously we did finals = [text], which wiped everything said before
+              // the latest pause (~endpointing ms), which felt like the start vanishing.
+              // chunk final (is_final, !speech_final) = locked ~3s segment within the
+              // open utterance; xAI may send cumulative or additive chunks.
+              if (msg.speech_final) {
+                const utterance = (text || openUtteranceText(live)).trim();
+                if (utterance) {
+                  const last = live.committed[live.committed.length - 1];
+                  if (last !== utterance) live.committed.push(utterance);
+                }
+                live.currentFinal = "";
+                live.interim = "";
+              } else if (text) {
+                live.currentFinal = mergeUtterance(live.currentFinal, text);
+                live.interim = "";
+              }
+            } else {
+              live.interim = text;
+            }
+            pushLiveToEditor();
+          } else if (msg.type === "transcript.done") {
+            // Server currently returns text:"" on transcript.done; never let empty
+            // overwrite partials/finals accumulated during the stream (?? only skips nullish).
+            const done = (msg.text ?? "").trim();
+            live.doneText = done || liveDisplayText(live);
+            live.status = "";
+            pushLiveToEditor();
+          } else if (msg.type === "error") {
+            live.status = msg.message ?? "STT error";
+          }
+        } catch {
+          // ignore
+        }
+      };
+      ws.addEventListener("message", onWsMessage);
+
+      const sendPcm = (chunk: Buffer) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        try {
+          ws.send(chunk);
+          bytesSent += chunk.length;
+        } catch {
+          // socket may be closing
+        }
+      };
+
+      pttRecorder = spawn(recorderSpec.cmd, recorderSpec.args, {
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      pttRecorder.on("error", () => {
+        live.status = "recorder failed";
+        setPttStatus(ctx, undefined);
+        closeOverlay?.("cancel");
+      });
+      // Spawn succeeded — treat as live immediately so the user gets feedback
+      // even before the first PCM chunk (device open can lag a beat).
+      if (pttRecorder.pid) markRecordingLive();
+      pttRecorder.stdout?.on("data", (data: Buffer) => {
+        markRecordingLive();
+        pcmBuf = Buffer.concat([pcmBuf, data]);
+        while (pcmBuf.length >= STT_CHUNK_BYTES) {
+          const frame = pcmBuf.subarray(0, STT_CHUNK_BYTES);
+          pcmBuf = pcmBuf.subarray(STT_CHUNK_BYTES);
+          sendPcm(Buffer.from(frame));
+        }
+      });
+
+      // Blocks until release (stop), Esc (cancel), or max-duration timeout.
+      const outcome = (await overlayDone) ?? "cancel";
+      cleanupUi();
+
+      await stopPttRecorder();
+      if (pcmBuf.length > 0) {
+        sendPcm(pcmBuf);
+        pcmBuf = Buffer.alloc(0);
+      }
+
+      if (outcome === "cancel" || outcome === "timeout") {
+        try { ws.close(); } catch { /* ignore */ }
+        restoreEditor();
+        ctx.ui.notify(
+          outcome === "timeout"
+            ? "Recording stopped — exceeded 5 minute limit. Message discarded."
+            : "Recording cancelled",
+          outcome === "timeout" ? "warning" : "info",
+        );
+        return;
+      }
+
+      // Release → finalize current utterance, then flush remaining audio.
+      live.recording = false;
+      live.status = "";
+      setPttStatus(ctx, undefined);
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "finalize" }));
+          ws.send(JSON.stringify({ type: "audio.done" }));
+        } catch { /* ignore */ }
+      }
+
+      const finalText = await new Promise<string>((resolve) => {
+        // Prefer non-empty doneText; empty string means server sent text:"" (known API quirk).
+        const done = (live.doneText ?? "").trim();
+        if (done) {
+          resolve(done);
+          return;
+        }
+        // If done already arrived empty, onWsMessage may have filled doneText from partials.
+        if (live.doneText !== undefined) {
+          resolve(liveDisplayText(live));
+          return;
+        }
+        const deadline = setTimeout(() => resolve(liveDisplayText(live)), 5_000);
+        const onFinal = (event: MessageEvent) => {
+          try {
+            const msg = JSON.parse(String(event.data)) as { type?: string; text?: string };
+            if (msg.type === "transcript.done") {
+              clearTimeout(deadline);
+              ws!.removeEventListener("message", onFinal);
+              const t = (msg.text ?? "").trim();
+              resolve(t || liveDisplayText(live));
+            }
+          } catch { /* ignore */ }
+        };
+        ws!.addEventListener("message", onFinal);
+      });
+
+      try { ws.close(); } catch { /* ignore */ }
+
+      const text = finalText.trim();
+      if (!text) {
+        restoreEditor();
+        ctx.ui.notify(
+          bytesSent < STT_CHUNK_BYTES ? "No audio captured" : "No speech detected",
+          "warning",
+        );
+        return;
+      }
+
+      // Final commit: base snapshot + finalized speech (drops stale interim).
+      const next = editorBase ? `${editorBase} ${text}` : text;
+      lastEditorPush = next;
+      ctx.ui.setEditorText(next);
     } catch (error) {
+      closeOverlay?.("cancel");
+      restoreEditor();
       const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(`Transcription failed: ${/abort|timed out/i.test(message) ? "request timed out after 60 seconds" : message}`, "error");
+      ctx.ui.notify(`Voice input failed: ${message}`, "error");
     } finally {
-      await unlink(MIC_PATH).catch(() => {});
+      cleanupUi();
+      await stopPttRecorder();
+      if (pttWs) {
+        try { pttWs.close(); } catch { /* ignore */ }
+        pttWs = null;
+      }
+      pttBusy = false;
     }
   }
 
-  pi.registerShortcut("f12", {
-    description: "Toggle voice input (mic → STT → send). Also stops TTS playback.",
+  pi.registerShortcut("ctrl+space", {
+    description: "Push-to-talk voice input (hold Ctrl+Space, release to insert into editor). Also stops TTS if playing.",
     handler: async (ctx) => {
       if (!ctx.hasUI) return;
       if (player) {
@@ -536,22 +1022,23 @@ export default function spacexai(pi: ExtensionAPI) {
         ctx.ui.notify("Stopped listening", "info");
         return;
       }
-      if (isRecording) await stopRecordingAndSend(ctx);
-      else await startRecording(ctx);
+      if (pttBusy) return; // key-repeat while held must not re-enter
+      await runPushToTalk(ctx);
     },
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    if (recordingTimeout) { clearTimeout(recordingTimeout); recordingTimeout = null; }
-    if (isRecording) {
-      isRecording = false;
-      recordingProcess?.kill("SIGTERM");
-      recordingProcess = null;
-      setMicWidget(ctx, false);
+    if (pttTimeout) { clearTimeout(pttTimeout); pttTimeout = null; }
+    await stopPttRecorder();
+    if (pttWs) {
+      try { pttWs.close(); } catch { /* ignore */ }
+      pttWs = null;
     }
+    pttBusy = false;
+    setPttStatus(ctx, undefined);
     player?.kill("SIGTERM");
     player = undefined;
     await unlink(AUDIO_PATH).catch(() => {});
-    await unlink(MIC_PATH).catch(() => {});
   });
 }
+
