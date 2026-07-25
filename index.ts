@@ -985,10 +985,6 @@ export default function spacexai(pi: ExtensionAPI) {
       const text = finalText.trim();
       if (!text) {
         restoreEditor();
-        ctx.ui.notify(
-          bytesSent < STT_CHUNK_BYTES ? "No audio captured" : "No speech detected",
-          "warning",
-        );
         return;
       }
 
