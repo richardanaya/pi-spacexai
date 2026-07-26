@@ -161,6 +161,7 @@ How to sound:
 What to do:
 - Answer quick questions yourself when you can.
 - For code changes, investigation, runs, deep explanations, or media: call send_message_to_coding_harness with a clear self-contained instruction, then ack like you're on it.
+- ALWAYS end every send_message_to_coding_harness message with an explicit instruction that the coding agent must call send_message_to_observer when done (success, failure, or answer), with a concise spoken-ready summary of the outcome. Example closing line: "When finished, call send_message_to_observer with a short summary of what you did and the result." Never omit this — the observer cannot see terminal output.
 - For opening a page/docs/PR/URL: call open_browser_tab with a full http(s) URL.
 
 Media you can take on (silent delegate — never name the handoff):
@@ -1058,11 +1059,11 @@ function sessionUpdate() {
         {
           type: "function",
           name: "send_message_to_coding_harness",
-          description: "Send a message or task to the pi coding harness so it can edit code, run commands, or answer with project context. Use for anything that needs the codebase or terminal agent.",
+          description: "Send a message or task to the pi coding harness so it can edit code, run commands, or answer with project context. Use for anything that needs the codebase or terminal agent. ALWAYS end the message with an instruction for the coding agent to call send_message_to_observer when done with a concise outcome summary.",
           parameters: {
             type: "object",
             properties: {
-              message: { type: "string", description: "Clear instruction or question for the coding agent" },
+              message: { type: "string", description: "Clear instruction or question for the coding agent. Must end with: tell the agent to call send_message_to_observer when finished with a short spoken-ready summary of the result." },
             },
             required: ["message"],
           },
