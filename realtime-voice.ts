@@ -170,7 +170,8 @@ Media you can take on (silent delegate — never name the handoff):
 - Speech files: text-to-speech to a path; speech-to-text from files/URLs.
 Spell out paths and preferences in the delegated task, then say something like "On it — generating that now."
 
-Keep spoken replies concise. Prefer short turns.`;
+Keep spoken replies concise. Prefer short turns.
+- Do not speak IP addresses or file paths unless the user specifically asks for them. Summarize locations in plain language instead (e.g. "the config file", "the local server") when enough context is clear.`;
 
 function clientHtml(opts: { model: string; voice: string }): string {
 	const model = JSON.stringify(opts.model);
@@ -271,7 +272,7 @@ function clientHtml(opts: { model: string; voice: string }): string {
     box-shadow:inset 0 0 0 1px rgba(255,255,255,.22); }
   .voiceRow .vname { text-transform:capitalize; overflow:hidden;
     text-overflow:ellipsis; white-space:nowrap; }
-  @media (max-width:480px) { #voiceList { grid-template-columns:repeat(2, 1fr); } }
+  @media (max-width:480px) { #voiceList grid-template-columns:repeat(2, 1fr); }
 </style>
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
@@ -703,7 +704,7 @@ inner.add(galaxyGroup);
 function spiralSampler(arms, rMax, thin) {
   return () => {
     const arm = Math.floor(Math.random() * arms);
-    const t = Math.pow(Math.random(), 0.62);
+    const t = Math.random() ** 0.62;
     const r = 0.04 + t * rMax;
     const wind = 3.1;
     const spread = (1 - t * 0.75) * 0.5;
@@ -901,7 +902,7 @@ function resize() {
 addEventListener('resize', resize);
 resize();
 
-let t0 = performance.now();
+const t0 = performance.now();
 let lastFrame = performance.now();
 function animate(now) {
   requestAnimationFrame(animate);
@@ -922,11 +923,11 @@ function animate(now) {
     else speakPeak *= 0.9995;
     const norm = rms / Math.max(speakPeak, 0.003);
     // Perceptual lift: quiet passages still move the orb
-    level = Math.min(1, Math.pow(Math.min(norm, 1.5), 0.55) * 1.2);
+    level = Math.min(1, Math.min(norm, 1.5) ** 0.55 * 1.2);
   }
   // Fast attack, slow time-based release
-  if (level > speakEnergy) speakEnergy += (level - speakEnergy) * (1 - Math.pow(0.00005, dt));
-  else speakEnergy *= Math.pow(0.05, dt);
+  if (level > speakEnergy) speakEnergy += (level - speakEnergy) * (1 - 0.00005 ** dt);
+  else speakEnergy *= 0.05 ** dt;
   const e = Math.min(1, speakEnergy);
 
   orb.position.set(0, 0, 0);
@@ -987,7 +988,7 @@ requestAnimationFrame(animate);
 function floatTo16BitPCM(float32) {
   const out = new Int16Array(float32.length);
   for (let i = 0; i < float32.length; i++) {
-    let s = Math.max(-1, Math.min(1, float32[i]));
+    const s = Math.max(-1, Math.min(1, float32[i]));
     out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
   return out;
