@@ -1,0 +1,20 @@
+{
+  "ignore": ["node_modules/**", "package-lock.json"],
+  "rules": {
+    "high-complexity": { "threshold": 200 },
+    "high-fan-out": { "threshold": 200 },
+    "hardcoded-url": { "enabled": false },
+    "long-parameter-list": { "enabled": false },
+    "no-any-type": { "enabled": false },
+    "ts-double-negation": { "enabled": false },
+    "no-extra-boolean-cast": { "enabled": false },
+    "no-as-any": { "enabled": false },
+    "nested-ternary": { "enabled": false },
+    "deep-nesting": { "enabled": false },
+    "async-noise": { "enabled": false },
+    "jscpd:duplicate": { "enabled": false },
+    "await-in-loop": { "enabled": false },
+    "knip:export": { "enabled": false },
+    "MD013": { "enabled": false }
+  }
+}

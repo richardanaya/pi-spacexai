@@ -47,6 +47,32 @@ Push-to-talk needs a terminal with **Kitty keyboard protocol** key-release event
 
 When the active model’s provider is `xai`, every Responses API request also exposes xAI’s server-side `web_search`, `x_search`, and `code_interpreter` tools. Grok decides when to invoke them alongside pi’s normal client-side function tools.
 
+### 7. Realtime voice observer (`/realtime-voice`)
+
+Start a **Grok speech-to-speech** co-pilot bridged to the coding session:
+
+```text
+/realtime-voice           # default port 3847 — opens your browser automatically
+/realtime-voice 4100      # custom port
+/realtime-voice-stop
+```
+
+What happens:
+
+1. A local server starts on `http://127.0.0.1:<port>/` and **opens that page in your browser**.
+2. The page requests an xAI **ephemeral token**, connects to `wss://api.x.ai/v1/realtime`, and starts the mic/speaker loop (server VAD).
+3. The voice agent can call **`send_message_to_coding_harness`** → messages enter the pi session as `{"source":"observer","message":"..."}` and trigger a turn.
+4. The coding agent can call **`send_message_to_observer`** → SSE pushes the text into the live voice session so Grok can speak the update.
+5. **`GET /api/events`** is the SSE stream used by the browser (and available to other local tools).
+
+Allow microphone access when the browser prompts. Default voice is **leo** (override with `/spacexai-voice <id>`).
+
+Voice-agent tools in the browser session:
+
+- `send_message_to_coding_harness` — drive the pi coding session
+- `open_browser_tab` — open an `http(s)` URL in the system browser (and try an in-page tab)
+- server-side `web_search`
+
 ## Load and authenticate
 
 ```bash
