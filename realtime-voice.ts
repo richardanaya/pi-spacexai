@@ -3,9 +3,10 @@
  *
  * Local HTTP server that:
  *  - Serves a browser speech-to-speech client (xAI Realtime via ephemeral token)
- *  - SSE `/api/events` for live status + harness→observer injects
+ *  - SSE `/api/events` for live status + harness→observer injects + harness status text
  *  - POST `/api/to-harness` when the voice agent calls send_message_to_coding_harness
  *  - In-process sendToObserver() for the pi tool send_message_to_observer
+ *  - In-process setHarnessStatus() for the pi tool set_harness_status (SSE → frontend HUD)
  */
 
 import {
@@ -30,6 +31,24 @@ const sendToObserverParams = Type.Object({
 });
 type SendToObserverParams = Static<typeof sendToObserverParams>;
 
+const setHarnessStatusParams = Type.Object({
+	status: Type.String({
+		description:
+			'Short status text for the coding harness HUD (what you are doing, or the latest completion). Prefer a lasting completion line like "Done: fixed auth bug" over clearing. Do not pass empty string to clear unless explicitly asked.',
+	}),
+});
+type SetHarnessStatusParams = Static<typeof setHarnessStatusParams>;
+
+/** Appended to the coding agent system prompt while /realtime-voice is running. */
+const CODING_AGENT_OBSERVER_PROMPT = `REALTIME VOICE OBSERVER
+A voice observer co-pilot is watching this coding harness (started with /realtime-voice). The observer speaks with the user in a browser and cannot read your normal terminal output, tool results, or assistant messages.
+
+You MUST use these tools to keep the observer and user in the loop:
+- send_message_to_observer — send a concise update or answer the observer can speak. Call this when work finishes, when answering a question that came from the observer, or when something important happens the user should hear. Bias toward spoken completion messages (what finished and the outcome), not just mid-progress chatter.
+- set_harness_status — keep a short live status line on the observer UI up to date. Set it when work starts, update it as you progress, and when finished leave a clear completion status (e.g. "Done: added login tests" or "Failed: type error in auth.ts"). Do NOT clear the status line — leave the latest completion/failure text visible so the observer UI still shows what happened. Only clear if the user explicitly asks you to.
+
+Do not assume the observer saw anything you only printed in the terminal. Prefer short spoken-ready messages.`;
+
 interface RealtimeVoiceOptions {
 	/** Fresh xAI bearer (OAuth or API key). */
 	getToken: () => Promise<string>;
@@ -49,6 +68,9 @@ interface RealtimeVoiceServer {
 	port: number;
 	url: string;
 	sendToObserver: (message: string) => boolean;
+	/** Push coding-harness status text to the browser HUD over SSE. */
+	setHarnessStatus: (status: string) => boolean;
+	getHarnessStatus: () => string;
 	stop: () => Promise<void>;
 	clientCount: () => number;
 }
@@ -127,16 +149,27 @@ function openBrowser(url: string): void {
 
 const DEFAULT_VOICE = "leo";
 
-const DEFAULT_INSTRUCTIONS = `You are the voice observer co-pilot for a coding harness called pi.
-You speak with the user in real time while a separate coding agent works in the terminal on their codebase.
+const DEFAULT_INSTRUCTIONS = `You are the voice co-pilot for a coding session powered by pi. You speak with the user in real time.
 
-Your job:
-- Answer quick questions conversationally.
-- When the user wants code changed, investigated, run, or explained in depth, call send_message_to_coding_harness with a clear, self-contained instruction for the coding agent.
-- When you receive messages tagged [coding_harness], treat them as updates or answers from the coding agent and summarize them briefly for the user in speech.
-- When the user asks to open a page, docs, PR, dashboard, or any URL, call open_browser_tab with a full http(s) URL.
+Core rule: silently delegate real work to the coding agent via send_message_to_coding_harness — and never mention that agent, the harness, the handoff, or that you are waiting on anything. To the user, you are simply doing the work.
 
-Keep spoken replies concise. Prefer short turns. Do not claim you edited files yourself — the coding harness does that.`;
+How to sound:
+- Short natural acks while work is out: "On it!", "One moment.", "Working on that.", "Got it."
+- Never say: coding harness/agent, "I'll send that", "waiting on", "when it's done", "I told the terminal", tool relays, or any back-channel.
+- When [coding_harness] updates arrive, treat them as your own results and speak the substance in first person ("Done — fixed the auth bug."). Do not say you received a message from anywhere.
+
+What to do:
+- Answer quick questions yourself when you can.
+- For code changes, investigation, runs, deep explanations, or media: call send_message_to_coding_harness with a clear self-contained instruction, then ack like you're on it.
+- For opening a page/docs/PR/URL: call open_browser_tab with a full http(s) URL.
+
+Media you can take on (silent delegate — never name the handoff):
+- Images: Grok Imagine generate/edit (text-to-image, multi-image edit, aspect ratio, 1K/2K).
+- Video: image-to-video, reference-to-video, edit, short extensions.
+- Speech files: text-to-speech to a path; speech-to-text from files/URLs.
+Spell out paths and preferences in the delegated task, then say something like "On it — generating that now."
+
+Keep spoken replies concise. Prefer short turns.`;
 
 function clientHtml(opts: { model: string; voice: string }): string {
 	const model = JSON.stringify(opts.model);
@@ -186,6 +219,12 @@ function clientHtml(opts: { model: string; voice: string }): string {
     text-decoration-color:#fff; }
   #caption a:visited { color:rgba(255,255,255,.6); }
   #caption.dim { opacity:.35; }
+  #harness { max-width:min(760px, 92vw); width:100%; text-align:center;
+    min-height:0; font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:rgba(255,255,255,.42); text-shadow:0 1px 10px rgba(0,0,0,.6);
+    transition: opacity .3s, color .3s; opacity:0; pointer-events:none;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #harness.on { opacity:1; color:rgba(255,255,255,.62); }
   #meta { font-size:11px; letter-spacing:.18em; text-transform:uppercase;
     color:rgba(255,255,255,.28); }
   #meta.live { color:rgba(255,255,255,.55); }
@@ -241,6 +280,7 @@ function clientHtml(opts: { model: string; voice: string }): string {
 <canvas id="c"></canvas>
 <div id="hint">listening</div>
 <div id="hud">
+  <div id="harness" aria-live="polite"></div>
   <div id="caption" class="dim"></div>
   <div id="meta"><span class="dot"></span><button id="voiceBtn" type="button" title="change voice"><span id="status">connecting</span></button></div>
 </div>
@@ -262,6 +302,7 @@ const SAMPLE_RATE = 24000;
 
 const statusEl = document.getElementById("status");
 const metaEl = document.getElementById("meta");
+const harnessEl = document.getElementById("harness");
 const captionEl = document.getElementById("caption");
 const hintEl = document.getElementById("hint");
 const canvas = document.getElementById("c");
@@ -281,10 +322,20 @@ let assistantBuf = "";
 let speakEnergy = 0;
 let speakPeak = 0.02;
 let connected = false;
+/** True between response.created and response.done/cancelled. */
+let responseActive = false;
+/** Harness inject arrived mid-response — create a follow-up turn when idle. */
+let pendingHarnessResponse = false;
 
 function setStatus(text, live) {
   statusEl.textContent = text;
   metaEl.classList.toggle("live", !!live);
+}
+function setHarnessStatusUi(text) {
+  const t = (text || "").trim();
+  harnessEl.textContent = t;
+  harnessEl.classList.toggle("on", !!t);
+  harnessEl.title = t;
 }
 // Escape-free linkifier: tokens split by whitespace char codes (no backslashes,
 // so template-literal layers and formatters can't corrupt the patterns).
@@ -998,7 +1049,7 @@ function sessionUpdate() {
     session: {
       voice: VOICE,
       instructions: INSTRUCTIONS,
-      turn_detection: { type: "server_vad", threshold: 0.85, silence_duration_ms: 600 },
+      turn_detection: { type: "server_vad", threshold: 0.5, silence_duration_ms: 600 },
       audio: {
         input: { format: { type: "audio/pcm", rate: SAMPLE_RATE } },
         output: { format: { type: "audio/pcm", rate: SAMPLE_RATE } },
@@ -1123,10 +1174,9 @@ function injectObserverMessage(message) {
   const text = "[coding_harness] " + message;
   line("sys", "harness → observer: " + message);
   touchActivity();
-  stopPlayback();
-  assistantBuf = "";
-  sendJson({ type: "response.cancel" });
-  sendJson({ type: "input_audio_buffer.clear" });
+  // Do not cancel an in-flight voice response — queue the harness update into
+  // the conversation and only request a new response when the model is idle.
+  // Creating a response while one is active confuses the realtime API.
   sendJson({
     type: "conversation.item.create",
     item: {
@@ -1135,13 +1185,31 @@ function injectObserverMessage(message) {
       content: [{ type: "input_text", text }],
     },
   });
-  sendJson({ type: "response.create" });
+  if (!responseActive) {
+    sendJson({ type: "response.create" });
+  } else {
+    // Model will pick up the new item after the current response finishes;
+    // kick a follow-up turn once it does.
+    pendingHarnessResponse = true;
+  }
 }
 
 function onServerEvent(event) {
   const t = event.type;
   // Any realtime traffic counts as activity (speech, audio, tools, session).
   if (t !== "error") touchActivity();
+  if (t === "response.created") {
+    responseActive = true;
+    return;
+  }
+  if (t === "response.done" || t === "response.cancelled") {
+    responseActive = false;
+    if (pendingHarnessResponse) {
+      pendingHarnessResponse = false;
+      sendJson({ type: "response.create" });
+    }
+    return;
+  }
   if (t === "response.output_audio.delta" || t === "response.audio.delta") {
     const b64 = event.delta || event.audio;
     if (b64) playPcm16(pcm16FromB64(b64));
@@ -1173,7 +1241,15 @@ function onServerEvent(event) {
     return;
   }
   if (t === "error") {
-    line("err", "error: " + JSON.stringify(event.error || event));
+    const err = event.error || event;
+    const msg = String(err.message || err || "");
+    // Benign race: cancel after the response already finished.
+    if (/no active response/i.test(msg) || /Cancellation failed/i.test(msg)) {
+      responseActive = false;
+      console.debug("realtime cancel ignored:", msg);
+      return;
+    }
+    line("err", "error: " + JSON.stringify(err));
     return;
   }
   if (t === "session.updated" || t === "session.created") {
@@ -1238,6 +1314,8 @@ function connectSse() {
       const msg = JSON.parse(ev.data);
       if (msg.type === "to_observer" && msg.message) {
         injectObserverMessage(String(msg.message));
+      } else if (msg.type === "harness_status") {
+        setHarnessStatusUi(msg.text != null ? String(msg.text) : "");
       } else if (msg.type === "status") {
         line("sys", msg.text || JSON.stringify(msg));
       }
@@ -1253,6 +1331,8 @@ function REALTIME_URL(model) {
 
 function cleanup() {
   connected = false;
+  responseActive = false;
+  pendingHarnessResponse = false;
   clearIdleTimers();
   stopMic();
   if (ws) { try { ws.close(); } catch {} ws = null; }
@@ -1406,6 +1486,8 @@ async function startRealtimeVoiceServer(
 	let sseId = 0;
 	const sseClients = new Set<SseClient>();
 	let closed = false;
+	/** Latest coding-harness status line shown in the browser HUD. */
+	let harnessStatus = "";
 	// Auto-stop when the browser goes away: once a client has connected,
 	// if all SSE clients disappear for longer than the grace window, self-stop
 	// (equivalent of /realtime-voice-stop). Grace covers page refreshes.
@@ -1463,6 +1545,16 @@ async function startRealtimeVoiceServer(
 		const text = message.trim();
 		if (!text) return false;
 		broadcast({ type: "to_observer", message: text, ts: Date.now() });
+		return sseClients.size > 0;
+	}
+
+	function setHarnessStatus(status: string): boolean {
+		harnessStatus = String(status ?? "").trim();
+		broadcast({
+			type: "harness_status",
+			text: harnessStatus,
+			ts: Date.now(),
+		});
 		return sseClients.size > 0;
 	}
 
@@ -1535,6 +1627,7 @@ async function startRealtimeVoiceServer(
 					model,
 					voice,
 					clients: sseClients.size,
+					harnessStatus,
 					instructionsPreview: instructions.slice(0, 120),
 				});
 				return;
@@ -1549,6 +1642,12 @@ async function startRealtimeVoiceServer(
 				res.write(
 					`data: ${JSON.stringify({ type: "status", text: "sse connected" })}\n\n`,
 				);
+				// Replay current harness status so late joiners / refreshes stay in sync.
+				if (harnessStatus) {
+					res.write(
+						`data: ${JSON.stringify({ type: "harness_status", text: harnessStatus, ts: Date.now() })}\n\n`,
+					);
+				}
 				const client: SseClient = { res, id: ++sseId };
 				sseClients.add(client);
 				everHadClient = true;
@@ -1621,6 +1720,29 @@ async function startRealtimeVoiceServer(
 				return;
 			}
 
+			if (method === "POST" && path === "/api/harness-status") {
+				const raw = await readBody(req);
+				let status = "";
+				try {
+					const body = JSON.parse(raw || "{}") as {
+						status?: string;
+						text?: string;
+					};
+					status = String(body.status ?? body.text ?? "");
+				} catch {
+					json(res, 400, { error: "invalid JSON" });
+					return;
+				}
+				const delivered = setHarnessStatus(status);
+				json(res, 200, {
+					ok: true,
+					delivered,
+					status: harnessStatus,
+					clients: sseClients.size,
+				});
+				return;
+			}
+
 			if (method === "POST" && path === "/api/open-tab") {
 				const raw = await readBody(req);
 				let target = "";
@@ -1666,6 +1788,8 @@ async function startRealtimeVoiceServer(
 		port,
 		url,
 		sendToObserver,
+		setHarnessStatus,
+		getHarnessStatus: () => harnessStatus,
 		clientCount: () => sseClients.size,
 		stop: () =>
 			new Promise((resolve) => {
@@ -1692,7 +1816,12 @@ function openRealtimeVoiceBrowser(url: string): void {
 	openBrowser(url);
 }
 
-/** Wire slash commands + harness tool onto an ExtensionAPI. */
+const OBSERVER_TOOL_NAMES = [
+	"send_message_to_observer",
+	"set_harness_status",
+] as const;
+
+/** Wire slash commands + harness tools onto an ExtensionAPI. */
 export function registerRealtimeVoice(
 	pi: ExtensionAPI,
 	deps: {
@@ -1705,6 +1834,7 @@ export function registerRealtimeVoice(
 	},
 ): void {
 	let server: RealtimeVoiceServer | null = null;
+	let observerToolsActive = false;
 	let statusCtx: {
 		ui?: {
 			setStatus?(k: string, v: string | undefined): void;
@@ -1718,6 +1848,111 @@ export function registerRealtimeVoice(
 			statusCtx.ui.setStatus("spacexai-realtime", label);
 		}
 	};
+
+	/** Register (or re-register) observer tools and add them to the active tool set. */
+	function enableObserverTools(): void {
+		pi.registerTool({
+			name: "send_message_to_observer",
+			label: "Send Message to Voice Observer",
+			description:
+				"Send information to the realtime speech-to-speech observer session. The voice agent will hear/see this update and can speak it to the user. The observer cannot read normal terminal output.",
+			promptSnippet: "Send a message to the realtime voice observer",
+			promptGuidelines: [
+				"When you complete work the user asked about via voice, or when answering an observer question, call send_message_to_observer with a concise status or answer.",
+				"Do not call this tool if the realtime voice server is not running.",
+			],
+			parameters: sendToObserverParams,
+			async execute(_id, params: SendToObserverParams, _signal, _update, _ctx) {
+				if (!server) {
+					throw new Error(
+						"Realtime voice is not running. Start it with /realtime-voice",
+					);
+				}
+				const message = String(params.message || "").trim();
+				if (!message) throw new Error("message is required");
+				const delivered = server.sendToObserver(message);
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: delivered
+								? `Delivered to observer (${server.clientCount()} SSE client(s)).`
+								: `Queued/broadcast to observer but no browser SSE client is connected yet. Open ${server.url}`,
+						},
+					],
+					details: { delivered, clients: server.clientCount(), message },
+				};
+			},
+		});
+
+		pi.registerTool({
+			name: "set_harness_status",
+			label: "Set Coding Harness Status",
+			description:
+				'Update the live coding-harness status text shown in the realtime voice observer UI (browser HUD over SSE). Use short phrases for in-progress work, and prefer a lasting completion/failure line when done (e.g. "Done: fixed flaky test"). Do not clear the status unless the user asks.',
+			promptSnippet: "Update live harness status on the voice observer UI",
+			promptGuidelines: [
+				"Keep set_harness_status up to date as work starts and progresses. When work finishes, set a completion or failure status and leave it — do not clear the status line.",
+				"Bias toward completion messages on the status line so the observer UI still shows the latest outcome after you stop working.",
+				"Status text is visual-only for the observer UI — it is not spoken. Use send_message_to_observer for spoken updates (also prefer completion answers there).",
+			],
+			parameters: setHarnessStatusParams,
+			async execute(
+				_id,
+				params: SetHarnessStatusParams,
+				_signal,
+				_update,
+				_ctx,
+			) {
+				if (!server) {
+					throw new Error(
+						"Realtime voice is not running. Start it with /realtime-voice",
+					);
+				}
+				const status = String(params.status ?? "");
+				const delivered = server.setHarnessStatus(status);
+				const current = server.getHarnessStatus();
+				const suffix = delivered ? "" : " (no SSE client yet)";
+				const text = current
+					? `Harness status set${suffix}: ${current}`
+					: `Harness status cleared${suffix}.`;
+				return {
+					content: [{ type: "text" as const, text }],
+					details: {
+						delivered,
+						clients: server.clientCount(),
+						status: current,
+					},
+				};
+			},
+		});
+
+		// First registration auto-activates; re-start after stop must re-add explicitly.
+		const active = new Set(pi.getActiveTools());
+		for (const name of OBSERVER_TOOL_NAMES) active.add(name);
+		pi.setActiveTools([...active]);
+		observerToolsActive = true;
+	}
+
+	/** Drop observer tools from the active set so the LLM can no longer call them. */
+	function disableObserverTools(): void {
+		if (!observerToolsActive) return;
+		const drop = new Set<string>(OBSERVER_TOOL_NAMES);
+		pi.setActiveTools(pi.getActiveTools().filter((n) => !drop.has(n)));
+		observerToolsActive = false;
+	}
+
+	function teardownServer(): void {
+		// Clear HUD status before dropping the server reference.
+		try {
+			server?.setHarnessStatus("");
+		} catch {
+			/* ignore */
+		}
+		server = null;
+		disableObserverTools();
+		setFooter(undefined);
+	}
 
 	pi.registerCommand("realtime-voice", {
 		description:
@@ -1748,8 +1983,7 @@ export function registerRealtimeVoice(
 					getToken: () => deps.getToken(ctx),
 					onSelfStop: () => {
 						// Browser closed and no SSE clients returned — same as /realtime-voice-stop
-						server = null;
-						setFooter(undefined);
+						teardownServer();
 						if (ctx.hasUI) {
 							ctx.ui.notify("Realtime voice stopped (browser closed)", "info");
 						}
@@ -1774,6 +2008,7 @@ export function registerRealtimeVoice(
 						}
 					},
 				});
+				enableObserverTools();
 				setFooter(`voice:${server.port}`);
 				ctx.ui.notify(
 					`Realtime voice on ${server.url} (voice=${voice}). Opened browser.`,
@@ -1781,8 +2016,7 @@ export function registerRealtimeVoice(
 				);
 				openRealtimeVoiceBrowser(server.url);
 			} catch (e) {
-				server = null;
-				setFooter(undefined);
+				teardownServer();
 				ctx.ui.notify(
 					`Failed to start realtime voice: ${e instanceof Error ? e.message : String(e)}`,
 					"error",
@@ -1799,51 +2033,23 @@ export function registerRealtimeVoice(
 				return;
 			}
 			await server.stop();
-			server = null;
-			setFooter(undefined);
+			teardownServer();
 			ctx.ui.notify("Realtime voice stopped", "info");
 		},
 	});
 
-	pi.registerTool({
-		name: "send_message_to_observer",
-		label: "Send Message to Voice Observer",
-		description:
-			"Send information to the realtime speech-to-speech observer session (started with /realtime-voice). The voice agent will hear/see this update and can speak it to the user.",
-		promptSnippet: "Send a message to the realtime voice observer",
-		promptGuidelines: [
-			"When /realtime-voice is active and you complete work the user asked about via voice, call send_message_to_observer with a concise status or answer.",
-			"Do not call this tool if the realtime voice server is not running.",
-		],
-		parameters: sendToObserverParams,
-		async execute(_id, params: SendToObserverParams, _signal, _update, _ctx) {
-			if (!server) {
-				throw new Error(
-					"Realtime voice is not running. Start it with /realtime-voice",
-				);
-			}
-			const message = String(params.message || "").trim();
-			if (!message) throw new Error("message is required");
-			const delivered = server.sendToObserver(message);
-			return {
-				content: [
-					{
-						type: "text" as const,
-						text: delivered
-							? `Delivered to observer (${server.clientCount()} SSE client(s)).`
-							: `Queued/broadcast to observer but no browser SSE client is connected yet. Open ${server.url}`,
-					},
-				],
-				details: { delivered, clients: server.clientCount(), message },
-			};
-		},
+	// While the observer is live, remind the coding agent how to communicate with it.
+	pi.on("before_agent_start", async (event) => {
+		if (!server) return;
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n${CODING_AGENT_OBSERVER_PROMPT}`,
+		};
 	});
 
 	pi.on("session_shutdown", async () => {
 		if (server) {
 			await server.stop();
-			server = null;
 		}
-		setFooter(undefined);
+		teardownServer();
 	});
 }

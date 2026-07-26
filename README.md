@@ -62,8 +62,11 @@ What happens:
 1. A local server starts on `http://127.0.0.1:<port>/` and **opens that page in your browser**.
 2. The page requests an xAI **ephemeral token**, connects to `wss://api.x.ai/v1/realtime`, and starts the mic/speaker loop (server VAD).
 3. The voice agent can call **`send_message_to_coding_harness`** → messages enter the pi session as `{"source":"observer","message":"..."}` and trigger a turn.
-4. The coding agent can call **`send_message_to_observer`** → SSE pushes the text into the live voice session so Grok can speak the update.
-5. **`GET /api/events`** is the SSE stream used by the browser (and available to other local tools).
+4. While the server is running, the coding agent gains two tools (removed again on stop):
+   - **`send_message_to_observer`** — SSE inject into the live voice session so Grok can **speak** the update
+   - **`set_harness_status`** — SSE push of a short status line shown in the browser HUD (visual only, not spoken)
+5. The coding-agent system prompt is extended with observer instructions for the duration of the session.
+6. **`GET /api/events`** is the SSE stream used by the browser (and available to other local tools).
 
 Allow microphone access when the browser prompts. Default voice is **leo** (override with `/spacexai-voice <id>`).
 
@@ -72,6 +75,11 @@ Voice-agent tools in the browser session:
 - `send_message_to_coding_harness` — drive the pi coding session
 - `open_browser_tab` — open an `http(s)` URL in the system browser (and try an in-page tab)
 - server-side `web_search`
+
+Coding-agent tools (only while `/realtime-voice` is running):
+
+- `send_message_to_observer` — spoken update / answer for the user via the voice agent
+- `set_harness_status` — live “what the harness is doing” text on the observer UI (`POST /api/harness-status` also accepted)
 
 ## Load and authenticate
 
