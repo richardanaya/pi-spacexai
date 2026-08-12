@@ -16,8 +16,11 @@ At request time, tokens come from pi’s model registry (`getApiKeyForProvider("
 
 Generate and edit images, or create, edit, and extend videos without leaving the coding harness. Requests expose the documented Grok Imagine controls rather than hiding them behind simplified presets:
 
-- Text-to-image and image editing with up to three source images
+- Text-to-image and image editing with up to five source images (grok-imagine-image-2.0 supports up to 5; older models may reject >3)
+- Full support for **grok-imagine-image-2.0** (the new Quality Mode) with `quality` parameter (`low` or `medium`)
+- Optional `storage_options` for server-side file storage with custom filenames, expiry times, and public URLs
 - 1–10 image variations, every supported aspect ratio, and 1K/2K resolution
+- Correct Files API `file_id` handling for image edits
 - Image-to-video and reference-to-video workflows (separate tools, matching Grok Build names)
 - Exact video duration control in seconds, aspect ratio, and 480p/720p/1080p resolution
 - Video editing and 2–10 second extensions
@@ -120,8 +123,8 @@ Select Grok models with `/model` under provider **`xai`** (built into pi).
 
 ## REST media tools
 
-- `image_gen`: model, prompt, 1–10 images, every documented aspect ratio, 1k/2k resolution, URL/base64 response, and a required output path.
-- `image_edit`: single or up to three source images, all documented edit options, and a required output path.
+- `image_gen`: model (`grok-imagine-image`, `grok-imagine-image-quality`, or `grok-imagine-image-2.0`), prompt, 1–10 images, every documented aspect ratio, 1k/2k resolution, optional `quality` (`low`/`medium`, 2.0 only), optional `storage_options` (filename, expiry, public_url), URL/base64 response, and a required output path.
+- `image_edit`: single or up to five source images (grok-imagine-image-2.0 supports up to 5; older models may reject >3), all documented edit options including `quality` (2.0 only) and `storage_options`, correct `file_id` handling for Files API inputs, and a required output path.
 - `image_to_video`: single source image → video (optional prompt, duration, resolution); polls until completion and downloads to a required output path.
 - `reference_to_video`: 2–7 reference images + prompt → video (duration, aspect ratio, resolution); polls until completion and downloads to a required output path.
 - `video_edit`: prompt/video, documented (service-ignored) geometry fields, and a required output path. It polls until completion.
@@ -130,7 +133,17 @@ Select Grok models with `/model` under provider **`xai`** (built into pi).
 - `speech_to_text`: file or URL transcription with raw format/sample rate, language/formatting, multichannel/channels, diarization, repeatable keyterms, and filler-word options.
 - `list_speech_voices`: list available built-in and custom voices.
 
-Media inputs accept HTTP(S) URLs, data URIs, Files API IDs, or local paths (an optional leading `@` is stripped). Relative paths resolve from pi's current working directory. Local image/video inputs are encoded as data URIs. Output directories are created automatically. Temporary image/video URLs should be downloaded promptly using `outputPath`.
+Media inputs accept HTTP(S) URLs, data URIs, Files API IDs (`file_...` → correct `file_id` shape), or local paths (an optional leading `@` is stripped). Relative paths resolve from pi's current working directory. Local image/video inputs are encoded as data URIs. Output directories are created automatically. Temporary image/video URLs should be downloaded promptly using `outputPath`.
+
+### storage_options (optional)
+
+When provided, instructs the xAI API to store generated images server-side:
+
+- `filename` (required): custom filename for the stored file
+- `expires_after` (optional): expiry in seconds (3600–2592000 / 1 hour to 30 days)
+- `public_url` (optional): boolean or `{ expires_after?: number }` for public URL generation
+
+The response may include `file_output` and/or `public_url` fields; these are included in the tool's `details` return value. The tool still downloads and saves files locally to `outputPath` as usual.
 
 ## Speech slash commands and Ctrl+Space PTT
 

@@ -422,20 +422,66 @@ export default function spacexai(pi: ExtensionAPI) {
 	] as const);
 	const imageCommon = {
 		model: Type.String({
-			description: "grok-imagine-image or grok-imagine-image-quality",
+			description:
+				"grok-imagine-image, grok-imagine-image-quality (aliases: grok-imagine-image-pro, *-latest), or grok-imagine-image-2.0",
 		}),
 		prompt: Type.String(),
 		aspect_ratio: Type.Optional(aspectImage),
 		resolution: Type.Optional(
 			Type.Union([Type.Literal("1k"), Type.Literal("2k")]),
 		),
+		quality: Type.Optional(
+			Type.Union([Type.Literal("low"), Type.Literal("medium")], {
+				description:
+					"Quality preset; only supported for grok-imagine-image-2.0 (defaults to medium)",
+			}),
+		),
 		response_format: Type.Optional(
 			Type.Union([Type.Literal("url"), Type.Literal("b64_json")]),
+		),
+		storage_options: Type.Optional(
+			Type.Object(
+				{
+					filename: Type.String({
+						description: "Required when storage_options is present",
+					}),
+					expires_after: Type.Optional(
+						Type.Integer({
+							minimum: 3600,
+							maximum: 2592000,
+							description: "Expiry in seconds (1 hour to 30 days)",
+						}),
+					),
+					public_url: Type.Optional(
+						Type.Union([
+							Type.Boolean(),
+							Type.Object({
+								expires_after: Type.Optional(
+									Type.Integer({
+										minimum: 3600,
+										maximum: 2592000,
+									}),
+								),
+							}),
+						]),
+					),
+				},
+				{ description: "Optional storage configuration for generated files" },
+			),
 		),
 		outputPath: Type.String({
 			description: "Required destination filename; numbered when n > 1",
 		}),
 	};
+	async function imageInputRef(
+		ctx: ExtensionContext,
+		value: string,
+	): Promise<{ file_id: string } | { url: string; type: string }> {
+		if (/^file_/i.test(value)) {
+			return { file_id: value };
+		}
+		return { url: await mediaRef(ctx, value), type: "image_url" };
+	}
 	pi.registerTool({
 		name: "image_gen",
 		label: "Grok Imagine Image Generation",
@@ -458,12 +504,12 @@ export default function spacexai(pi: ExtensionAPI) {
 		name: "image_edit",
 		label: "Grok Imagine Image Edit",
 		description:
-			"Grok Imagine: edit one or up to three images. Inputs may be URLs, file IDs, data URIs, or local paths.",
+			"Grok Imagine: edit one or up to five images (grok-imagine-image-2.0 supports up to 5; older models may reject >3). Inputs may be URLs, file IDs, data URIs, or local paths.",
 		parameters: Type.Object({
 			...imageCommon,
 			image: Type.Optional(Type.String()),
 			images: Type.Optional(
-				Type.Array(Type.String(), { minItems: 1, maxItems: 3 }),
+				Type.Array(Type.String(), { minItems: 1, maxItems: 5 }),
 			),
 		}),
 		async execute(_id, p, signal, _u, ctx) {
@@ -471,14 +517,10 @@ export default function spacexai(pi: ExtensionAPI) {
 				throw new Error("Provide exactly one of image or images");
 			const { outputPath, image, images, ...rest } = p;
 			const body: Record<string, unknown> = { ...rest };
-			if (image)
-				body.image = { url: await mediaRef(ctx, image), type: "image_url" };
+			if (image) body.image = await imageInputRef(ctx, image);
 			if (images)
 				body.images = await Promise.all(
-					images.map(async (x: string) => ({
-						url: await mediaRef(ctx, x),
-						type: "image_url",
-					})),
+					images.map(async (x: string) => await imageInputRef(ctx, x)),
 				);
 			return imageResult(
 				ctx,
