@@ -230,6 +230,91 @@ async function jsonPost(
 		signal,
 	).then((r) => r.json());
 }
+
+/** Same shape Grok Build's WebSearchClient reads from /v1/responses. */
+function responsesOutputText(data: {
+	output?: unknown;
+	output_text?: unknown;
+}): { text: string; citations: string[] } {
+	const citations: string[] = [];
+	const texts: string[] = [];
+	const output = Array.isArray(data.output) ? data.output : [];
+	for (const item of output) {
+		if (!isRecord(item) || item.type !== "message") continue;
+		const content = Array.isArray(item.content) ? item.content : [];
+		for (const part of content) {
+			if (!isRecord(part)) continue;
+			if (part.type === "output_text" && typeof part.text === "string") {
+				texts.push(part.text);
+			}
+			const anns = Array.isArray(part.annotations) ? part.annotations : [];
+			for (const ann of anns) {
+				if (isRecord(ann) && typeof ann.url === "string" && ann.url) {
+					citations.push(ann.url);
+				}
+			}
+		}
+	}
+	if (!texts.length && typeof data.output_text === "string") {
+		texts.push(data.output_text);
+	}
+	return {
+		text: texts.join("\n") || "No search results found.",
+		citations: [...new Set(citations)],
+	};
+}
+
+const SEARCH_TIMEOUT_MS = 90_000;
+
+function searchAbortSignal(signal?: AbortSignal): AbortSignal {
+	const timeout = AbortSignal.timeout(SEARCH_TIMEOUT_MS);
+	if (!signal) return timeout;
+	if (typeof AbortSignal.any === "function") return AbortSignal.any([signal, timeout]);
+	return timeout;
+}
+
+async function runXaiAgentSearch(
+	ctx: ExtensionContext,
+	query: string,
+	tools: Record<string, unknown>[],
+	signal?: AbortSignal,
+): Promise<{ text: string; citations: string[]; model: string }> {
+	const model =
+		ctx.model?.provider === PROVIDER && ctx.model.id
+			? ctx.model.id
+			: "grok-4.6";
+	// Grok Build's WebSearchClient: short, low-temp Responses call.
+	// Do not inherit grok-4.6's default high reasoning — that hangs the tool.
+	const data = await jsonPost(
+		ctx,
+		"/responses",
+		{
+			model,
+			input: query,
+			tools,
+			store: false,
+			temperature: 0.1,
+			top_p: 0.95,
+			max_output_tokens: 8192,
+			reasoning: { effort: "low" },
+		},
+		searchAbortSignal(signal),
+	);
+	return { ...responsesOutputText(data), model };
+}
+
+async function runXaiWebSearch(
+	ctx: ExtensionContext,
+	query: string,
+	allowedDomains: string[] | undefined,
+	signal?: AbortSignal,
+): Promise<{ text: string; citations: string[]; model: string }> {
+	const tool: Record<string, unknown> = { type: "web_search" };
+	if (allowedDomains?.length) {
+		tool.filters = { allowed_domains: allowedDomains.slice(0, 5) };
+	}
+	return runXaiAgentSearch(ctx, query, [tool], signal);
+}
 async function saveRemote(
 	url: string,
 	path: string,
@@ -366,6 +451,31 @@ async function play(audio: Buffer): Promise<void> {
 	await unlink(AUDIO_PATH).catch(() => {});
 }
 
+/** Completions rejects these types (422) or 410s on live_search. */
+const COMPLETIONS_FORBIDDEN_TOOL_TYPES = new Set([
+	"web_search",
+	"x_search",
+	"code_interpreter",
+	"live_search",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function stripForbiddenCompletionsTools(
+	payload: Record<string, unknown>,
+): Record<string, unknown> {
+	if (!Array.isArray(payload.tools)) return payload;
+	const tools = payload.tools.filter(
+		(tool) =>
+			!isRecord(tool) ||
+			typeof tool.type !== "string" ||
+			!COMPLETIONS_FORBIDDEN_TOOL_TYPES.has(tool.type),
+	);
+	return { ...payload, tools };
+}
+
 export default function spacexai(pi: ExtensionAPI) {
 	// pi now owns the xAI OAuth provider. This extension only layers media/speech UX
 	// on top, and stays inert unless ~/.pi/agent/auth.json already has xai credentials.
@@ -373,26 +483,105 @@ export default function spacexai(pi: ExtensionAPI) {
 		return;
 	}
 
-	// xAI Responses executes these tools server-side. They are distinct from pi's
-	// client-side function tools and can coexist in the same request.
+	// Do not flip model.api / setModel here: that rewrites the session
+	// model, re-emits model_select, and looks like a pi restart.
+	// Pi's xAI provider is Chat Completions; hosted Agent Tools cannot
+	// ride that wire. Search is the client-side web_search tool below.
 	pi.on("before_provider_request", (event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER) return;
-		if (!event.payload || typeof event.payload !== "object") return;
-		const payload = event.payload as Record<string, unknown>;
-		const tools = Array.isArray(payload.tools) ? [...payload.tools] : [];
-		const existingTypes = new Set(
-			tools
-				.filter(
-					(tool): tool is Record<string, unknown> =>
-						!!tool && typeof tool === "object",
-				)
-				.map((tool) => tool.type)
-				.filter((type): type is string => typeof type === "string"),
-		);
-		for (const type of ["web_search", "x_search", "code_interpreter"]) {
-			if (!existingTypes.has(type)) tools.push({ type });
-		}
-		return { ...payload, tools };
+		if (!isRecord(event.payload)) return;
+		if (!Array.isArray(event.payload.messages)) return;
+		return stripForbiddenCompletionsTools(event.payload);
+	});
+
+	// Grok Build WebSearchClient: POST /v1/responses with hosted web_search.
+	// X/Twitter is a separate tool (x_search), matching grok-4.6 Agent Tools.
+	pi.registerTool({
+		name: "web_search",
+		label: "Web Search",
+		description:
+			"Search the public web for up-to-date information. Use for news, docs, or facts not in the repo. For X/Twitter posts use x_search.",
+		promptSnippet: "Search the web with web_search",
+		promptGuidelines: [
+			"Use web_search for current events, docs, or facts not in the repo.",
+			"Do not use web_search for X/Twitter. Use x_search for posts, accounts, or threads.",
+		],
+		parameters: Type.Object({
+			query: Type.String({ description: "The search query to perform." }),
+			allowed_domains: Type.Optional(
+				Type.Array(Type.String(), {
+					maxItems: 5,
+					description: "Optional list of domains to restrict search to.",
+				}),
+			),
+		}),
+		async execute(_id, p, signal, _u, ctx) {
+			const result = await runXaiWebSearch(
+				ctx,
+				p.query,
+				p.allowed_domains,
+				signal,
+			);
+			const cites = result.citations.length
+				? `\n\nCitations:\n${result.citations.map((u) => `- ${u}`).join("\n")}`
+				: "";
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `${result.text}${cites}`,
+					},
+				],
+				details: result,
+			};
+		},
+	});
+
+	// Grok 4.6 hosted x_search (supports_backend_search). Same Completions
+	// workaround: function tool → POST /v1/responses with { type: "x_search" }.
+	pi.registerTool({
+		name: "x_search",
+		label: "X Search",
+		description:
+			"Search X (Twitter) posts, users, and threads. Grok 4.6 Agent Tool. Use for live posts, accounts, or conversations on X.",
+		promptSnippet: "Search X with x_search",
+		promptGuidelines: [
+			"Use x_search when the user wants posts, accounts, or threads on X/Twitter.",
+			"Prefer x_search over web_search for X-specific lookups.",
+		],
+		parameters: Type.Object({
+			query: Type.String({
+				description: "What to search for on X (keywords, topic, or @handle).",
+			}),
+			from_date: Type.Optional(
+				Type.String({
+					description: "Inclusive start date (YYYY-MM-DD).",
+				}),
+			),
+			to_date: Type.Optional(
+				Type.String({
+					description: "Exclusive end date (YYYY-MM-DD).",
+				}),
+			),
+		}),
+		async execute(_id, p, signal, _u, ctx) {
+			const tool: Record<string, unknown> = { type: "x_search" };
+			if (p.from_date) tool.from_date = p.from_date;
+			if (p.to_date) tool.to_date = p.to_date;
+			const result = await runXaiAgentSearch(ctx, p.query, [tool], signal);
+			const cites = result.citations.length
+				? `\n\nCitations:\n${result.citations.map((u) => `- ${u}`).join("\n")}`
+				: "";
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `${result.text}${cites}`,
+					},
+				],
+				details: result,
+			};
+		},
 	});
 
 	const aspectImage = literalUnion([

@@ -48,7 +48,12 @@ Push-to-talk needs a terminal with **Kitty keyboard protocol** key-release event
 
 ### 6. Server-side Grok tools on xAI models
 
-When the active model’s provider is `xai`, every Responses API request also exposes xAI’s server-side `web_search`, `x_search`, and `code_interpreter` tools. Grok decides when to invoke them alongside pi’s normal client-side function tools.
+Pi’s built-in xAI provider uses **Chat Completions**. Hosted Agent Tools (`{ type: "web_search" }`) and Live Search both fail on that wire (422 / 410). This extension does not switch the chat transport.
+
+Instead it registers client-side function tools that call those Agent Tools on `/v1/responses` (same workaround as Grok Build’s WebSearchClient, because pi’s chat turn is still Completions):
+
+- `web_search` — public web only (`{ type: "web_search" }`)
+- `x_search` — X/Twitter only (`{ type: "x_search" }`, optional `from_date` / `to_date`)
 
 ### 7. Realtime voice observer (`/realtime-voice`)
 
