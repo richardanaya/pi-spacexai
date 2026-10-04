@@ -17,13 +17,14 @@ At request time, tokens come from pi’s model registry (`getApiKeyForProvider("
 Generate and edit images, or create, edit, and extend videos without leaving the coding harness. Requests expose the documented Grok Imagine controls rather than hiding them behind simplified presets:
 
 - Text-to-image and image editing with up to five source images (grok-imagine-image-2.0 supports up to 5; older models may reject >3)
-- Full support for **grok-imagine-image-2.0** (the new Quality Mode) with `quality` parameter (`low` or `medium`)
+- Full support for **grok-imagine-image-2.0** with `quality` (`low`, `medium`, or `auto`), `1k` / `1.5k` / `2k`, and aspect ratios through `21:9` and `5:2`
 - Optional `storage_options` for server-side file storage with custom filenames, expiry times, and public URLs
 - 1–10 image variations, every supported aspect ratio, and 1K/2K resolution
 - Correct Files API `file_id` handling for image edits
-- Image-to-video and reference-to-video workflows (separate tools, matching Grok Build names)
+- Text-to-video, image-to-video, and reference-to-video (separate tools, matching Grok Build names)
+- On **grok-imagine-video-1.5**: native 1080p for text-to-video and image-to-video, preset voices (`reference_audios`), a pinned `last_frame`, and up to four interior `keyframes`
 - Exact video duration control in seconds, aspect ratio, and 480p/720p/1080p resolution
-- Video editing and 2–10 second extensions
+- Video editing and 2–10 second extensions, including Files API `file_id` inputs and optional `storage_options`
 - Automatic job polling, output downloading, and explicit destination paths
 
 ### 3. Generate and transcribe audio with TTS/STT
@@ -52,8 +53,8 @@ Pi’s built-in xAI provider uses **Chat Completions**. Hosted Agent Tools (`{ t
 
 Instead it registers client-side function tools that call those Agent Tools on `/v1/responses` (same workaround as Grok Build’s WebSearchClient, because pi’s chat turn is still Completions):
 
-- `web_search` — public web only (`{ type: "web_search" }`)
-- `x_search` — X/Twitter only (`{ type: "x_search" }`, optional `from_date` / `to_date`)
+- `web_search` — public web only (`{ type: "web_search" }`). Optional `allowed_domains` or `excluded_domains` (max 5, not both), `enable_image_understanding`, and `enable_image_search`.
+- `x_search` — X/Twitter only (`{ type: "x_search" }`). Optional inclusive `from_date` / `to_date`, and `allowed_x_handles` or `excluded_x_handles` (max 20, not both).
 
 ### 7. Realtime voice observer (`/realtime-voice`)
 
@@ -128,14 +129,15 @@ Select Grok models with `/model` under provider **`xai`** (built into pi).
 
 ## REST media tools
 
-- `image_gen`: model (`grok-imagine-image`, `grok-imagine-image-quality`, or `grok-imagine-image-2.0`), prompt, 1–10 images, every documented aspect ratio, 1k/2k resolution, optional `quality` (`low`/`medium`, 2.0 only), optional `storage_options` (filename, expiry, public_url), URL/base64 response, and a required output path.
+- `image_gen`: model (`grok-imagine-image`, `grok-imagine-image-quality`, or `grok-imagine-image-2.0`), prompt, 1–10 images, every documented aspect ratio (including `21:9` and `5:2`), `1k`/`1.5k`/`2k` resolution, optional `quality` (`low`/`medium`/`auto`, 2.0 only; omit or `auto` lets the service choose), optional `storage_options` (filename, expiry, public_url), URL/base64 response, and a required output path. After November 2, 2026, `grok-imagine-image-quality` is served as `grok-imagine-image-2.0` with `quality: "low"`.
 - `image_edit`: single or up to five source images (grok-imagine-image-2.0 supports up to 5; older models may reject >3), all documented edit options including `quality` (2.0 only) and `storage_options`, correct `file_id` handling for Files API inputs, and a required output path.
-- `image_to_video`: single source image → video (optional prompt, duration, resolution); polls until completion and downloads to a required output path.
-- `reference_to_video`: 2–7 reference images + prompt → video (duration, aspect ratio, resolution); polls until completion and downloads to a required output path.
-- `video_edit`: prompt/video, documented (service-ignored) geometry fields, and a required output path. It polls until completion.
-- `video_extend`: prompt/video, optional 2–10 second extension duration, and a required output path. It polls until completion.
-- `text_to_speech`: text/language, voice, speed, codec, sample rate, MP3 bit rate, latency optimization, normalization, timestamps, and a required `outputPath`. The tool only saves audio and does not play it. Timestamp envelopes can be saved separately.
-- `speech_to_text`: file or URL transcription with raw format/sample rate, language/formatting, multichannel/channels, diarization, repeatable keyterms, and filler-word options.
+- `text_to_video`: prompt → video (`grok-imagine-video`, `grok-imagine-video-1.5`, or `grok-imagine-video-1.5-lite`), duration 1–15s, aspect ratio, 480p/720p/1080p. 1080p is native on 1.5. Optional `storage_options`. Polls until completion and downloads to a required output path.
+- `image_to_video`: single source image → video (optional prompt, duration, resolution, optional `last_frame` on 1.5). `file_id` inputs use the Files API shape. Polls until completion and downloads to a required output path.
+- `reference_to_video`: up to 7 reference images, up to 3 preset voices (`reference_audios[].voice_id`, tag `<AUDIO_0>`), optional first-frame `image`, `last_frame`, and up to 4 `keyframes` (`timestamp_s` strictly inside the clip). At least one reference or pin is required. Prompt is required unless a frame is pinned. Resolution cap for this mode is 720p. Partner-only custom audio clips can be passed as `reference_audios[].audio`.
+- `video_edit`: prompt and an mp4 (`url` or `file_id`). Optional `storage_options`. It polls until completion.
+- `video_extend`: prompt and an mp4, optional 2–10 second extension duration (default 6), optional `storage_options`. The source video must be 2–15 seconds. It polls until completion.
+- `text_to_speech`: text up to 60,000 characters, language, voice, speed, codec, sample rate, MP3 bit rate, latency optimization (`0` or `1`), normalization, timestamps, and a required `outputPath`. The tool only saves audio and does not play it. Timestamp envelopes can be saved separately.
+- `speech_to_text`: file or URL transcription with raw format/sample rate, language/formatting, multichannel/channels, diarization, repeatable keyterms, filler words, and `vad_threshold` (0–1).
 - `list_speech_voices`: list available built-in and custom voices.
 
 Media inputs accept HTTP(S) URLs, data URIs, Files API IDs (`file_...` → correct `file_id` shape), or local paths (an optional leading `@` is stripped). Relative paths resolve from pi's current working directory. Local image/video inputs are encoded as data URIs. Output directories are created automatically. Temporary image/video URLs should be downloaded promptly using `outputPath`.
@@ -145,7 +147,7 @@ Media inputs accept HTTP(S) URLs, data URIs, Files API IDs (`file_...` → corre
 When provided, instructs the xAI API to store generated images server-side:
 
 - `filename` (required): custom filename for the stored file
-- `expires_after` (optional): expiry in seconds (3600–2592000 / 1 hour to 30 days)
+- `expires_after` (optional): seconds until the stored file expires (maximum 2592000 / 30 days). Omit it and the file does not expire.
 - `public_url` (optional): boolean or `{ expires_after?: number }` for public URL generation
 
 The response may include `file_output` and/or `public_url` fields; these are included in the tool's `details` return value. The tool still downloads and saves files locally to `outputPath` as usual.
@@ -164,6 +166,6 @@ Esc                      # cancel push-to-talk and restore the editor
 /remove-speaking-style
 ```
 
-Playback requires `ffplay` from FFmpeg. TTS text is limited to 15,000 characters. `/set-speaking-style` stores a persistent style description and injects it into the system prompt so responses are written for that delivery; `/remove-speaking-style` clears it. Slash-command configuration is stored at `~/.pi/spacexai.json` with user-only permissions.
+Playback requires `ffplay` from FFmpeg. TTS text is limited to 60,000 characters. `/set-speaking-style` stores a persistent style description and injects it into the system prompt so responses are written for that delivery; `/remove-speaking-style` clears it. Slash-command configuration is stored at `~/.pi/spacexai.json` with user-only permissions.
 
 Voice input streams raw PCM16 mono @ 16 kHz over `wss://api.x.ai/v1/stt` (`interim_results=true`). On release the client sends `finalize` then `audio.done` and uses the resulting transcript. Local recorder preference: **arecord** (ALSA raw PCM on Linux), then **ffmpeg** (stdout s16le). Auth is the same xAI bearer from pi’s model registry.

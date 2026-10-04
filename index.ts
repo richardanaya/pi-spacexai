@@ -306,13 +306,30 @@ async function runXaiAgentSearch(
 async function runXaiWebSearch(
 	ctx: ExtensionContext,
 	query: string,
-	allowedDomains: string[] | undefined,
+	options: {
+		allowedDomains?: string[];
+		excludedDomains?: string[];
+		enableImageUnderstanding?: boolean;
+		enableImageSearch?: boolean;
+	},
 	signal?: AbortSignal,
 ): Promise<{ text: string; citations: string[]; model: string }> {
-	const tool: Record<string, unknown> = { type: "web_search" };
-	if (allowedDomains?.length) {
-		tool.filters = { allowed_domains: allowedDomains.slice(0, 5) };
+	if (options.allowedDomains?.length && options.excludedDomains?.length) {
+		throw new Error(
+			"allowed_domains and excluded_domains cannot be set together",
+		);
 	}
+	const tool: Record<string, unknown> = { type: "web_search" };
+	const filters: Record<string, string[]> = {};
+	if (options.allowedDomains?.length) {
+		filters.allowed_domains = options.allowedDomains.slice(0, 5);
+	}
+	if (options.excludedDomains?.length) {
+		filters.excluded_domains = options.excludedDomains.slice(0, 5);
+	}
+	if (Object.keys(filters).length) tool.filters = filters;
+	if (options.enableImageUnderstanding) tool.enable_image_understanding = true;
+	if (options.enableImageSearch) tool.enable_image_search = true;
 	return runXaiAgentSearch(ctx, query, [tool], signal);
 }
 async function saveRemote(
@@ -405,8 +422,8 @@ async function synthesize(
 	overrides: Partial<Config> = {},
 ): Promise<Buffer> {
 	if (!text.trim()) throw new Error("Text must not be empty");
-	if (text.length > 15_000)
-		throw new Error("SpaceXAI TTS accepts at most 15,000 characters");
+	if (text.length > 60_000)
+		throw new Error("SpaceXAI TTS accepts at most 60,000 characters");
 	const config = { ...(await readConfig()), ...overrides };
 	const response = await fetch(`${API_BASE}/tts`, {
 		method: "POST",
@@ -511,7 +528,27 @@ export default function spacexai(pi: ExtensionAPI) {
 			allowed_domains: Type.Optional(
 				Type.Array(Type.String(), {
 					maxItems: 5,
-					description: "Optional list of domains to restrict search to.",
+					description:
+						"Only search these domains. Cannot be combined with excluded_domains.",
+				}),
+			),
+			excluded_domains: Type.Optional(
+				Type.Array(Type.String(), {
+					maxItems: 5,
+					description:
+						"Skip these domains. Cannot be combined with allowed_domains.",
+				}),
+			),
+			enable_image_understanding: Type.Optional(
+				Type.Boolean({
+					description:
+						"Let the search inspect images on pages it browses.",
+				}),
+			),
+			enable_image_search: Type.Optional(
+				Type.Boolean({
+					description:
+						"Include image results. The answer may contain Markdown image embeds.",
 				}),
 			),
 		}),
@@ -519,7 +556,12 @@ export default function spacexai(pi: ExtensionAPI) {
 			const result = await runXaiWebSearch(
 				ctx,
 				p.query,
-				p.allowed_domains,
+				{
+					allowedDomains: p.allowed_domains,
+					excludedDomains: p.excluded_domains,
+					enableImageUnderstanding: p.enable_image_understanding,
+					enableImageSearch: p.enable_image_search,
+				},
 				signal,
 			);
 			const cites = result.citations.length
@@ -560,14 +602,43 @@ export default function spacexai(pi: ExtensionAPI) {
 			),
 			to_date: Type.Optional(
 				Type.String({
-					description: "Exclusive end date (YYYY-MM-DD).",
+					description: "Inclusive end date (YYYY-MM-DD).",
+				}),
+			),
+			allowed_x_handles: Type.Optional(
+				Type.Array(Type.String(), {
+					maxItems: 20,
+					description:
+						"Only posts from these handles, without @. Cannot be combined with excluded_x_handles.",
+				}),
+			),
+			excluded_x_handles: Type.Optional(
+				Type.Array(Type.String(), {
+					maxItems: 20,
+					description:
+						"Skip posts from these handles, without @. Cannot be combined with allowed_x_handles.",
 				}),
 			),
 		}),
 		async execute(_id, p, signal, _u, ctx) {
+			if (p.allowed_x_handles?.length && p.excluded_x_handles?.length) {
+				throw new Error(
+					"allowed_x_handles and excluded_x_handles cannot be set together",
+				);
+			}
 			const tool: Record<string, unknown> = { type: "x_search" };
 			if (p.from_date) tool.from_date = p.from_date;
 			if (p.to_date) tool.to_date = p.to_date;
+			if (p.allowed_x_handles?.length) {
+				tool.allowed_x_handles = p.allowed_x_handles
+					.slice(0, 20)
+					.map((handle) => handle.replace(/^@/, ""));
+			}
+			if (p.excluded_x_handles?.length) {
+				tool.excluded_x_handles = p.excluded_x_handles
+					.slice(0, 20)
+					.map((handle) => handle.replace(/^@/, ""));
+			}
 			const result = await runXaiAgentSearch(ctx, p.query, [tool], signal);
 			const cites = result.citations.length
 				? `\n\nCitations:\n${result.citations.map((u) => `- ${u}`).join("\n")}`
@@ -598,6 +669,8 @@ export default function spacexai(pi: ExtensionAPI) {
 		"9:19.5",
 		"20:9",
 		"9:20",
+		"21:9",
+		"5:2",
 		"auto",
 	] as const);
 	const aspectVideo = literalUnion([
@@ -612,18 +685,25 @@ export default function spacexai(pi: ExtensionAPI) {
 	const imageCommon = {
 		model: Type.String({
 			description:
-				"grok-imagine-image, grok-imagine-image-quality (aliases: grok-imagine-image-pro, *-latest), or grok-imagine-image-2.0",
+				"grok-imagine-image, grok-imagine-image-quality (retired 2026-11-02; served as grok-imagine-image-2.0 quality low), or grok-imagine-image-2.0",
 		}),
 		prompt: Type.String(),
 		aspect_ratio: Type.Optional(aspectImage),
 		resolution: Type.Optional(
-			Type.Union([Type.Literal("1k"), Type.Literal("2k")]),
+			Type.Union([
+				Type.Literal("1k"),
+				Type.Literal("1.5k"),
+				Type.Literal("2k"),
+			]),
 		),
 		quality: Type.Optional(
-			Type.Union([Type.Literal("low"), Type.Literal("medium")], {
-				description:
-					"Quality preset; only supported for grok-imagine-image-2.0 (defaults to medium)",
-			}),
+			Type.Union(
+				[Type.Literal("low"), Type.Literal("medium"), Type.Literal("auto")],
+				{
+					description:
+						"grok-imagine-image-2.0 only. Omit or auto: low for generation, medium for edits. Pin low or medium to force a tier.",
+				},
+			),
 		),
 		response_format: Type.Optional(
 			Type.Union([Type.Literal("url"), Type.Literal("b64_json")]),
@@ -636,9 +716,9 @@ export default function spacexai(pi: ExtensionAPI) {
 					}),
 					expires_after: Type.Optional(
 						Type.Integer({
-							minimum: 3600,
 							maximum: 2592000,
-							description: "Expiry in seconds (1 hour to 30 days)",
+							description:
+								"Seconds until the stored file expires (max 30 days). Omit to keep the file.",
 						}),
 					),
 					public_url: Type.Optional(
@@ -646,10 +726,7 @@ export default function spacexai(pi: ExtensionAPI) {
 							Type.Boolean(),
 							Type.Object({
 								expires_after: Type.Optional(
-									Type.Integer({
-										minimum: 3600,
-										maximum: 2592000,
-									}),
+									Type.Integer({ maximum: 2592000 }),
 								),
 							}),
 						]),
@@ -720,53 +797,100 @@ export default function spacexai(pi: ExtensionAPI) {
 		},
 	});
 
-	const videoCommon = {
-		model: Type.String({ description: "grok-imagine-video" }),
-		prompt: Type.String(),
-		duration: Type.Optional(Type.Number()),
-		aspect_ratio: Type.Optional(aspectVideo),
-		resolution: Type.Optional(
-			Type.Union([
-				Type.Literal("480p"),
-				Type.Literal("720p"),
-				Type.Literal("1080p"),
-			]),
-		),
-	};
-	// Split to match grok-build tool names: image_to_video (single source frame) vs reference_to_video (multi-ref).
-	pi.registerTool({
-		name: "image_to_video",
-		label: "Grok Imagine Image-to-Video",
+	const videoResolution = Type.Optional(
+		Type.Union([
+			Type.Literal("480p"),
+			Type.Literal("720p"),
+			Type.Literal("1080p"),
+		]),
+	);
+	const videoModel = Type.String({
 		description:
-			"Grok Imagine: animate a single source image into a video. The image becomes frame 1. Local media is converted to data URIs.",
+			"grok-imagine-video, grok-imagine-video-1.5, or grok-imagine-video-1.5-lite. 1080p, voices, last_frame, and keyframes need 1.5 (reference-to-video stays 720p).",
+	});
+	const videoStorage = imageCommon.storage_options;
+	async function pictureRef(
+		ctx: ExtensionContext,
+		value: string,
+	): Promise<{ file_id: string } | { url: string }> {
+		if (/^file_/i.test(value)) return { file_id: value };
+		return { url: await mediaRef(ctx, value) };
+	}
+	async function videoInputRef(
+		ctx: ExtensionContext,
+		value: string,
+	): Promise<{ file_id: string } | { url: string }> {
+		return pictureRef(ctx, value);
+	}
+	const keyframeParam = Type.Object({
+		image: Type.String({
+			description: "URL, data URI, file ID, or local path",
+		}),
+		timestamp_s: Type.Number({
+			minimum: 0,
+			description:
+				"Seconds strictly inside the clip (greater than 0 and less than duration). Anchors snap to a 1/3s grid.",
+		}),
+	});
+	// Split to match grok-build tool names: text, single source frame, and references.
+	pi.registerTool({
+		name: "text_to_video",
+		label: "Grok Imagine Text-to-Video",
+		description:
+			"Grok Imagine: generate a video from a text prompt. Duration 1–15s (default 8). grok-imagine-video-1.5 supports native 1080p.",
 		parameters: Type.Object({
-			model: Type.String({ description: "grok-imagine-video" }),
-			image: Type.String({
-				description:
-					"Source image to animate (URL, data URI, file ID, or local path)",
-			}),
-			prompt: Type.Optional(
-				Type.String({ description: "Optional animation guidance" }),
-			),
+			model: videoModel,
+			prompt: Type.String(),
 			duration: Type.Optional(Type.Number({ minimum: 1, maximum: 15 })),
-			resolution: Type.Optional(
-				Type.Union([
-					Type.Literal("480p"),
-					Type.Literal("720p"),
-					Type.Literal("1080p"),
-				]),
-			),
+			aspect_ratio: Type.Optional(aspectVideo),
+			resolution: videoResolution,
+			storage_options: videoStorage,
 			outputPath: Type.String({
 				description: "Required destination video filename",
 			}),
 		}),
 		async execute(_id, p, signal, _u, ctx) {
-			const { image, outputPath, prompt, ...rest } = p;
-			const body: any = {
+			const { outputPath, ...body } = p;
+			const data = await jsonPost(ctx, "/videos/generations", body, signal);
+			return saveVideoJob(ctx, data.request_id, outputPath, signal);
+		},
+	});
+	pi.registerTool({
+		name: "image_to_video",
+		label: "Grok Imagine Image-to-Video",
+		description:
+			"Grok Imagine: animate a source image. The image is frame 1. On grok-imagine-video-1.5, last_frame pins the closing frame (interpolation). Aspect ratio follows the source image unless last_frame is set. 1080p is native on 1.5.",
+		parameters: Type.Object({
+			model: videoModel,
+			image: Type.String({
+				description:
+					"Source image (URL, data URI, file ID, or local path)",
+			}),
+			last_frame: Type.Optional(
+				Type.String({
+					description:
+						"grok-imagine-video-1.5: image the clip must end on. Same input kinds as image.",
+				}),
+			),
+			prompt: Type.Optional(
+				Type.String({ description: "Optional motion and camera guidance" }),
+			),
+			duration: Type.Optional(Type.Number({ minimum: 1, maximum: 15 })),
+			aspect_ratio: Type.Optional(aspectVideo),
+			resolution: videoResolution,
+			storage_options: videoStorage,
+			outputPath: Type.String({
+				description: "Required destination video filename",
+			}),
+		}),
+		async execute(_id, p, signal, _u, ctx) {
+			const { image, last_frame, outputPath, prompt, ...rest } = p;
+			const body: Record<string, unknown> = {
 				...rest,
-				prompt: prompt ?? "",
-				image: { url: await mediaRef(ctx, image) },
+				image: await pictureRef(ctx, image),
 			};
+			if (prompt) body.prompt = prompt;
+			if (last_frame) body.last_frame = await pictureRef(ctx, last_frame);
 			const data = await jsonPost(ctx, "/videos/generations", body, signal);
 			return saveVideoJob(ctx, data.request_id, outputPath, signal);
 		},
@@ -775,34 +899,113 @@ export default function spacexai(pi: ExtensionAPI) {
 		name: "reference_to_video",
 		label: "Grok Imagine Reference-to-Video",
 		description:
-			"Grok Imagine: generate a video from multiple reference images guided by a text prompt. Local media is converted to data URIs.",
+			"Grok Imagine: video from reference images and/or preset voices. On grok-imagine-video-1.5, image pins frame 1, last_frame pins the end, and keyframes (max 4) pin interior frames. Tag images <IMAGE_0>… and voices <AUDIO_0>… in the prompt. If image is set, references start at <IMAGE_1>. Max 7 images, 3 voices, 720p. Prompt is optional when a frame is pinned.",
 		parameters: Type.Object({
-			model: Type.String({ description: "grok-imagine-video" }),
-			prompt: Type.String(),
-			reference_images: Type.Array(Type.String(), { minItems: 2, maxItems: 7 }),
+			model: videoModel,
+			prompt: Type.Optional(Type.String()),
+			image: Type.Optional(
+				Type.String({
+					description: "grok-imagine-video-1.5: pin this image as frame 1",
+				}),
+			),
+			last_frame: Type.Optional(
+				Type.String({
+					description: "grok-imagine-video-1.5: pin this image as the last frame",
+				}),
+			),
+			reference_images: Type.Optional(
+				Type.Array(Type.String(), { maxItems: 7 }),
+			),
+			reference_audios: Type.Optional(
+				Type.Array(
+					Type.Object({
+						voice_id: Type.Optional(
+							Type.String({
+								description: "Preset voice id, same roster as TTS (eve, leo, ara, rex, sal)",
+							}),
+						),
+						audio: Type.Optional(
+							Type.String({
+								description:
+									"Partner-only custom clip: URL, data URI, or local path. Mutually exclusive with voice_id.",
+							}),
+						),
+					}),
+					{ maxItems: 3 },
+				),
+			),
+			keyframes: Type.Optional(Type.Array(keyframeParam, { maxItems: 4 })),
 			duration: Type.Optional(Type.Number({ minimum: 1, maximum: 15 })),
 			aspect_ratio: Type.Optional(aspectVideo),
-			resolution: Type.Optional(
-				Type.Union([
-					Type.Literal("480p"),
-					Type.Literal("720p"),
-					Type.Literal("1080p"),
-				]),
-			),
+			resolution: videoResolution,
+			storage_options: videoStorage,
 			outputPath: Type.String({
 				description: "Required destination video filename",
 			}),
 		}),
 		async execute(_id, p, signal, _u, ctx) {
-			const { reference_images, outputPath, ...rest } = p;
-			const body: any = {
-				...rest,
-				reference_images: await Promise.all(
-					reference_images.map(async (x: string) => ({
-						url: await mediaRef(ctx, x),
+			const refs = p.reference_images ?? [];
+			const audios = p.reference_audios ?? [];
+			const frames = p.keyframes ?? [];
+			if (
+				!refs.length &&
+				!audios.length &&
+				!frames.length &&
+				!p.image &&
+				!p.last_frame
+			) {
+				throw new Error(
+					"Provide reference_images, reference_audios, image, last_frame, or keyframes",
+				);
+			}
+			if (!p.prompt && !p.image && !p.last_frame && !frames.length) {
+				throw new Error(
+					"Prompt is required unless image, last_frame, or keyframes pins a frame",
+				);
+			}
+			const {
+				outputPath,
+				reference_images: _refs,
+				reference_audios: _audios,
+				keyframes: _frames,
+				image,
+				last_frame,
+				prompt,
+				...rest
+			} = p;
+			const body: Record<string, unknown> = { ...rest };
+			if (prompt) body.prompt = prompt;
+			if (image) body.image = await pictureRef(ctx, image);
+			if (last_frame) body.last_frame = await pictureRef(ctx, last_frame);
+			if (refs.length) {
+				body.reference_images = await Promise.all(
+					refs.map((x) => pictureRef(ctx, x)),
+				);
+			}
+			if (audios.length) {
+				body.reference_audios = await Promise.all(
+					audios.map(async (entry) => {
+						if (entry.voice_id && entry.audio) {
+							throw new Error(
+								"Each reference_audios entry needs voice_id or audio, not both",
+							);
+						}
+						if (entry.voice_id) return { voice_id: entry.voice_id };
+						if (entry.audio) return { url: await mediaRef(ctx, entry.audio) };
+						throw new Error(
+							"Each reference_audios entry needs voice_id or audio",
+						);
+					}),
+				);
+			}
+			if (frames.length) {
+				body.keyframes = await Promise.all(
+					frames.map(async (frame) => ({
+						timestamp_s: frame.timestamp_s,
+						image: await pictureRef(ctx, frame.image),
 					})),
-				),
-			};
+				);
+			}
 			const data = await jsonPost(ctx, "/videos/generations", body, signal);
 			return saveVideoJob(ctx, data.request_id, outputPath, signal);
 		},
@@ -811,20 +1014,22 @@ export default function spacexai(pi: ExtensionAPI) {
 		name: "video_edit",
 		label: "Grok Imagine Video Edit",
 		description:
-			"Grok Imagine: edit a video. Geometry options are accepted by REST but ignored by the service.",
+			"Grok Imagine: edit a video with a text prompt. Input must be an mp4 (URL, data URI, file ID, or local path).",
 		parameters: Type.Object({
-			...videoCommon,
+			model: videoModel,
+			prompt: Type.String(),
 			video: Type.String(),
+			storage_options: videoStorage,
 			outputPath: Type.String({
 				description: "Required destination video filename",
 			}),
 		}),
 		async execute(_id, p, signal, _u, ctx) {
-			const { outputPath, ...body } = p;
+			const { outputPath, video, ...body } = p;
 			const data = await jsonPost(
 				ctx,
 				"/videos/edits",
-				{ ...body, video: { url: await mediaRef(ctx, p.video) } },
+				{ ...body, video: await videoInputRef(ctx, video) },
 				signal,
 			);
 			return saveVideoJob(ctx, data.request_id, outputPath, signal);
@@ -833,22 +1038,24 @@ export default function spacexai(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "video_extend",
 		label: "Grok Imagine Video Extension",
-		description: "Grok Imagine: extend a video by 2–10 seconds.",
+		description:
+			"Grok Imagine: continue a video from its last frame. The new segment is 2–10 seconds (default 6). Input must be an mp4 between 2 and 15 seconds.",
 		parameters: Type.Object({
-			model: Type.String({ description: "grok-imagine-video" }),
+			model: videoModel,
 			prompt: Type.String(),
 			video: Type.String(),
 			duration: Type.Optional(Type.Number({ minimum: 2, maximum: 10 })),
+			storage_options: videoStorage,
 			outputPath: Type.String({
 				description: "Required destination video filename",
 			}),
 		}),
 		async execute(_id, p, signal, _u, ctx) {
-			const { outputPath, ...body } = p;
+			const { outputPath, video, ...body } = p;
 			const data = await jsonPost(
 				ctx,
 				"/videos/extensions",
-				{ ...body, video: { url: await mediaRef(ctx, p.video) } },
+				{ ...body, video: await videoInputRef(ctx, video) },
 				signal,
 			);
 			return saveVideoJob(ctx, data.request_id, outputPath, signal);
@@ -865,7 +1072,7 @@ export default function spacexai(pi: ExtensionAPI) {
 			"Use text_to_speech when the user asks to speak, narrate, or synthesize text.",
 		],
 		parameters: Type.Object({
-			text: Type.String({ maxLength: 15000 }),
+			text: Type.String({ maxLength: 60000 }),
 			language: Type.String({ description: "BCP-47 code or auto" }),
 			voice_id: Type.Optional(Type.String()),
 			speed: Type.Optional(Type.Number({ minimum: 0.7, maximum: 1.5 })),
@@ -879,7 +1086,7 @@ export default function spacexai(pi: ExtensionAPI) {
 				literalUnion([32000, 64000, 96000, 128000, 192000] as const),
 			),
 			optimize_streaming_latency: Type.Optional(
-				literalUnion([0, 1, 2] as const),
+				literalUnion(["0", "1"] as const),
 			),
 			text_normalization: Type.Optional(Type.Boolean()),
 			with_timestamps: Type.Optional(Type.Boolean()),
@@ -974,6 +1181,14 @@ export default function spacexai(pi: ExtensionAPI) {
 				Type.Array(Type.String({ maxLength: 50 }), { maxItems: 100 }),
 			),
 			filler_words: Type.Optional(Type.Boolean()),
+			vad_threshold: Type.Optional(
+				Type.Number({
+					minimum: 0,
+					maximum: 1,
+					description:
+						"Voice-activity gate from 0 to 1. Lower keeps quieter speech. 0 disables the gate. Default 0.5.",
+				}),
+			),
 			outputPath: Type.Optional(
 				Type.String({ description: "Save full transcript JSON" }),
 			),
@@ -1056,7 +1271,7 @@ export default function spacexai(pi: ExtensionAPI) {
 				if (!text)
 					return void ctx.ui.notify("No assistant response to read", "warning");
 				ctx.ui.notify("Generating SpaceXAI speech…", "info");
-				await play(await synthesize(ctx, text.slice(0, 15_000)));
+				await play(await synthesize(ctx, text.slice(0, 60_000)));
 			} catch (error) {
 				ctx.ui.notify(
 					error instanceof Error ? error.message : String(error),
@@ -1148,7 +1363,7 @@ export default function spacexai(pi: ExtensionAPI) {
 		const { speakingStyle } = await readConfig();
 		if (!speakingStyle) return;
 		return {
-			systemPrompt: `${event.systemPrompt}\n\nSPOKEN DELIVERY STYLE\nWrite responses so they sound natural when synthesized as speech. Apply this speaking style consistently without mentioning these instructions: ${speakingStyle}\n\nYou may use xAI TTS speech tags sparingly when they naturally improve delivery. Inline tags include [pause], [long-pause], [laugh], [giggle], [chuckle], [sigh], [groan], [gasp], [breath], [inhale], [exhale], [lip-smack], [cough], [throat-clear], [sneeze], [whimper], and [swallow]. Wrapping tags include <whisper>, <loud>, <soft>, <emphasis>, <reduced>, <high>, <low>, <fast>, <slow>, <singing>, <shouting>, and <screaming>. Preserve technical correctness and do not force tags where they do not belong.`,
+			systemPrompt: `${event.systemPrompt}\n\nSPOKEN DELIVERY STYLE\nWrite responses so they sound natural when synthesized as speech. Apply this speaking style consistently without mentioning these instructions: ${speakingStyle}\n\nYou may use xAI TTS speech tags sparingly when they naturally improve delivery. Inline tags include [pause], [long-pause], [hum-tune], [laugh], [chuckle], [giggle], [cry], [tsk], [tongue-click], [lip-smack], [breath], [inhale], [exhale], and [sigh]. Wrapping tags include <soft>, <whisper>, <loud>, <build-intensity>, <decrease-intensity>, <higher-pitch>, <lower-pitch>, <slow>, <fast>, <sing-song>, <singing>, and <emphasis>. Preserve technical correctness and do not force tags where they do not belong.`,
 		};
 	});
 
@@ -1158,7 +1373,7 @@ export default function spacexai(pi: ExtensionAPI) {
 		const text = lastAssistantText(ctx);
 		if (!text) return;
 		try {
-			await play(await synthesize(ctx, text.slice(0, 15_000)));
+			await play(await synthesize(ctx, text.slice(0, 60_000)));
 		} catch (error) {
 			ctx.ui.notify(
 				`Auto-listen failed: ${error instanceof Error ? error.message : String(error)}`,
