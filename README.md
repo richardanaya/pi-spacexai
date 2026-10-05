@@ -56,39 +56,40 @@ Instead it registers client-side function tools that call those Agent Tools on `
 - `web_search` — public web only (`{ type: "web_search" }`). Optional `allowed_domains` or `excluded_domains` (max 5, not both), `enable_image_understanding`, and `enable_image_search`.
 - `x_search` — X/Twitter only (`{ type: "x_search" }`). Optional inclusive `from_date` / `to_date`, and `allowed_x_handles` or `excluded_x_handles` (max 20, not both).
 
-### 7. Realtime voice observer (`/realtime-voice`)
+### 7. Realtime voice (`/realtime-voice-start`)
 
-Start a **Grok speech-to-speech** co-pilot bridged to the coding session:
+Start a **Grok speech-to-speech** co-pilot in this terminal. There is no browser page. The extension opens `wss://api.x.ai/v1/realtime`, records the microphone, and plays replies with `ffplay`.
 
 ```text
-/realtime-voice           # default port 3847 — opens your browser automatically
-/realtime-voice 4100      # custom port
+/realtime-voice-start
+/realtime-voice-select eve   # no argument prints the current voice
 /realtime-voice-stop
 ```
 
 What happens:
 
-1. A local server starts on `http://127.0.0.1:<port>/` and **opens that page in your browser**.
-2. The page requests an xAI **ephemeral token**, connects to `wss://api.x.ai/v1/realtime`, and starts the mic/speaker loop (server VAD).
-3. The voice agent can call **`send_message_to_coding_harness`** → messages enter the pi session as `{"source":"observer","message":"..."}` and trigger a turn.
-4. While the server is running, the coding agent gains two tools (removed again on stop):
-   - **`send_message_to_observer`** — SSE inject into the live voice session so Grok can **speak** the update
-   - **`set_harness_status`** — SSE push of a short status line shown in the browser HUD (visual only, not spoken)
+1. The extension mints an ephemeral token and connects to `grok-voice-latest` with server VAD.
+2. The microphone is raw PCM from **arecord** (Linux) or **ffmpeg**. Replies play through **aplay**, **paplay**, or **ffplay**. Spoken words are not written into the chat.
+3. The voice agent calls **`send_task`**. The job is steered into the current pi turn. The tool returns a receipt. The outcome comes back later as `work_landed`.
+4. While the session is running, the coding agent gains two tools (removed again on stop):
+   - **`send_message_to_observer`** — queues a `work_landed` update. The session then calls `read_background_updates` so the voice agent can speak it
+   - **`set_harness_status`** — short status line in the terminal (not spoken)
 5. The coding-agent system prompt is extended with observer instructions for the duration of the session.
-6. **`GET /api/events`** is the SSE stream used by the browser (and available to other local tools).
+6. Five minutes of silence disconnects the socket. Speaking resets that timer.
 
-Allow microphone access when the browser prompts. Default voice is **leo** (override with `/spacexai-voice <id>`).
+Default voice is **leo**. `/realtime-voice-select` and `/spacexai-voice` write the same `~/.pi/spacexai.json` voice. Selecting a voice during a live session applies it immediately.
 
-Voice-agent tools in the browser session:
+Voice-agent tools:
 
-- `send_message_to_coding_harness` — drive the pi coding session
-- `open_browser_tab` — open an `http(s)` URL in the system browser (and try an in-page tab)
-- server-side `web_search`
+- `send_task` — request a job of at most 2000 characters. Returns a receipt. Overlong requests are rejected.
+- `search_conversations` — up to 6 earlier or current chats, best first. `scope` is `this-chat`, `earlier`, or `everything`. `id` reads one hit in full. `if_missing` is `say-no-record` or `send-task`.
+- `end_the_call` — hang up after a spoken goodbye. A tone plays on start and on stop.
+- `read_background_updates` — background mail, including `work_landed`. The session calls this. The voice agent does not.
 
-Coding-agent tools (only while `/realtime-voice` is running):
+Coding-agent tools (only while realtime voice is running):
 
 - `send_message_to_observer` — spoken update / answer for the user via the voice agent
-- `set_harness_status` — live “what the harness is doing” text on the observer UI (`POST /api/harness-status` also accepted)
+- `set_harness_status` — live “what the harness is doing” text in the terminal
 
 ## Load and authenticate
 
@@ -162,6 +163,9 @@ Esc                      # cancel push-to-talk and restore the editor
 /auto-listen-on
 /auto-listen-off
 /spacexai-voice eve
+/realtime-voice-start
+/realtime-voice-select eve
+/realtime-voice-stop
 /set-speaking-style warm, measured, and conversational
 /remove-speaking-style
 ```

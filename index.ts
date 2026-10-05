@@ -1357,6 +1357,11 @@ export default function spacexai(pi: ExtensionAPI) {
 	registerRealtimeVoice(pi, {
 		getToken: (ctx) => bearer(ctx as ExtensionContext),
 		readVoice: async () => (await readConfig()).voice,
+		writeVoice: async (voice) => {
+			const config = await readConfig();
+			config.voice = voice;
+			await saveConfig(config);
+		},
 	});
 
 	pi.on("before_agent_start", async (event) => {
