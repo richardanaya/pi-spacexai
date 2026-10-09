@@ -1,12 +1,13 @@
 {
   "name": "pi-spacexai",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Grok Imagine, TTS/STT, Ctrl+Space streaming push-to-talk, a realtime voice sidebar, and auto-speak for pi — uses built-in xAI OAuth from auth.json",
   "license": "MIT",
   "author": "Richard Anaya",
   "type": "module",
   "files": [
     "index.ts",
+    "xai-api.ts",
     "realtime-voice.ts",
     "voice-sidebar.ts",
     "README.md",

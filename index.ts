@@ -16,12 +16,31 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { exec, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { registerRealtimeVoice } from "./realtime-voice.ts";
+import {
+	buildAgentSearchBody,
+	buildSttWsUrl,
+	buildTtsBody,
+	buildWebSearchTool,
+	buildXSearchTool,
+	customVoicePage,
+	IMAGE_MODEL_2,
+	isRecord,
+	MAX_REFERENCE_IMAGES,
+	mergeVoiceCatalog,
+	normalizeImageRequest,
+	resolveSttModel,
+	responsesOutputText,
+	responsesSearchModel,
+	searchUsage,
+	STT_MODEL,
+	stripForbiddenCompletionsTools,
+	VIDEO_ASPECT_RATIOS,
+} from "./xai-api.ts";
 
 const execAsync = promisify(exec);
 /** Built-in pi provider id for xAI (OAuth subscription or API key). */
 const PROVIDER = "xai";
 const API_BASE = "https://api.x.ai/v1";
-const STT_WS_BASE = "wss://api.x.ai/v1/stt";
 const AUTH_PATH = join(homedir(), ".pi", "agent", "auth.json");
 const CONFIG_PATH = join(homedir(), ".pi", "spacexai.json");
 const AUDIO_PATH = join(homedir(), ".pi", "spacexai-tts.mp3");
@@ -231,39 +250,6 @@ async function jsonPost(
 	).then((r) => r.json());
 }
 
-/** Same shape Grok Build's WebSearchClient reads from /v1/responses. */
-function responsesOutputText(data: {
-	output?: unknown;
-	output_text?: unknown;
-}): { text: string; citations: string[] } {
-	const citations: string[] = [];
-	const texts: string[] = [];
-	const output = Array.isArray(data.output) ? data.output : [];
-	for (const item of output) {
-		if (!isRecord(item) || item.type !== "message") continue;
-		const content = Array.isArray(item.content) ? item.content : [];
-		for (const part of content) {
-			if (!isRecord(part)) continue;
-			if (part.type === "output_text" && typeof part.text === "string") {
-				texts.push(part.text);
-			}
-			const anns = Array.isArray(part.annotations) ? part.annotations : [];
-			for (const ann of anns) {
-				if (isRecord(ann) && typeof ann.url === "string" && ann.url) {
-					citations.push(ann.url);
-				}
-			}
-		}
-	}
-	if (!texts.length && typeof data.output_text === "string") {
-		texts.push(data.output_text);
-	}
-	return {
-		text: texts.join("\n") || "No search results found.",
-		citations: [...new Set(citations)],
-	};
-}
-
 const SEARCH_TIMEOUT_MS = 90_000;
 
 function searchAbortSignal(signal?: AbortSignal): AbortSignal {
@@ -278,59 +264,23 @@ async function runXaiAgentSearch(
 	query: string,
 	tools: Record<string, unknown>[],
 	signal?: AbortSignal,
-): Promise<{ text: string; citations: string[]; model: string }> {
-	const model =
-		ctx.model?.provider === PROVIDER && ctx.model.id
-			? ctx.model.id
-			: "grok-4.6";
-	// Grok Build's WebSearchClient: short, low-temp Responses call.
-	// Do not inherit grok-4.6's default high reasoning — that hangs the tool.
+	maxTurns?: number,
+): Promise<{
+	text: string;
+	citations: string[];
+	model: string;
+	usage?: Record<string, unknown>;
+}> {
+	const model = responsesSearchModel(
+		ctx.model?.provider === PROVIDER ? ctx.model : undefined,
+	);
 	const data = await jsonPost(
 		ctx,
 		"/responses",
-		{
-			model,
-			input: query,
-			tools,
-			store: false,
-			temperature: 0.1,
-			top_p: 0.95,
-			max_output_tokens: 8192,
-			reasoning: { effort: "low" },
-		},
+		buildAgentSearchBody({ model, query, tools, maxTurns }),
 		searchAbortSignal(signal),
 	);
-	return { ...responsesOutputText(data), model };
-}
-
-async function runXaiWebSearch(
-	ctx: ExtensionContext,
-	query: string,
-	options: {
-		allowedDomains?: string[];
-		excludedDomains?: string[];
-		enableImageUnderstanding?: boolean;
-		enableImageSearch?: boolean;
-	},
-	signal?: AbortSignal,
-): Promise<{ text: string; citations: string[]; model: string }> {
-	if (options.allowedDomains?.length && options.excludedDomains?.length) {
-		throw new Error(
-			"allowed_domains and excluded_domains cannot be set together",
-		);
-	}
-	const tool: Record<string, unknown> = { type: "web_search" };
-	const filters: Record<string, string[]> = {};
-	if (options.allowedDomains?.length) {
-		filters.allowed_domains = options.allowedDomains.slice(0, 5);
-	}
-	if (options.excludedDomains?.length) {
-		filters.excluded_domains = options.excludedDomains.slice(0, 5);
-	}
-	if (Object.keys(filters).length) tool.filters = filters;
-	if (options.enableImageUnderstanding) tool.enable_image_understanding = true;
-	if (options.enableImageSearch) tool.enable_image_search = true;
-	return runXaiAgentSearch(ctx, query, [tool], signal);
+	return { ...responsesOutputText(data), model, usage: searchUsage(data) };
 }
 async function saveRemote(
 	url: string,
@@ -431,13 +381,17 @@ async function synthesize(
 			Authorization: `Bearer ${await bearer(ctx)}`,
 			"Content-Type": "application/json",
 		},
-		body: JSON.stringify({
-			text,
-			voice_id: config.voice ?? "leo",
-			language: config.language ?? "en",
-			speed: config.speed ?? 1,
-			output_format: { codec: "mp3", sample_rate: 24_000, bit_rate: 128_000 },
-		}),
+		body: JSON.stringify(
+			buildTtsBody({
+				text,
+				voice_id: config.voice ?? "leo",
+				language: config.language ?? "en",
+				speed: config.speed ?? 1,
+				codec: "mp3",
+				sample_rate: 24_000,
+				bit_rate: 128_000,
+			}),
+		),
 	});
 	if (!response.ok)
 		throw new Error(
@@ -468,31 +422,6 @@ async function play(audio: Buffer): Promise<void> {
 	await unlink(AUDIO_PATH).catch(() => {});
 }
 
-/** Completions rejects these types (422) or 410s on live_search. */
-const COMPLETIONS_FORBIDDEN_TOOL_TYPES = new Set([
-	"web_search",
-	"x_search",
-	"code_interpreter",
-	"live_search",
-]);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-function stripForbiddenCompletionsTools(
-	payload: Record<string, unknown>,
-): Record<string, unknown> {
-	if (!Array.isArray(payload.tools)) return payload;
-	const tools = payload.tools.filter(
-		(tool) =>
-			!isRecord(tool) ||
-			typeof tool.type !== "string" ||
-			!COMPLETIONS_FORBIDDEN_TOOL_TYPES.has(tool.type),
-	);
-	return { ...payload, tools };
-}
-
 export default function spacexai(pi: ExtensionAPI) {
 	// pi now owns the xAI OAuth provider. This extension only layers media/speech UX
 	// on top, and stays inert unless ~/.pi/agent/auth.json already has xai credentials.
@@ -502,8 +431,9 @@ export default function spacexai(pi: ExtensionAPI) {
 
 	// Do not flip model.api / setModel here: that rewrites the session
 	// model, re-emits model_select, and looks like a pi restart.
-	// Pi's xAI provider is Chat Completions; hosted Agent Tools cannot
-	// ride that wire. Search is the client-side web_search tool below.
+	// Pi's xAI provider is Chat Completions. Server-side Agent Tools
+	// belong on /v1/responses, so they are stripped off this wire.
+	// Search is the client-side web_search tool below.
 	pi.on("before_provider_request", (event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER) return;
 		if (!isRecord(event.payload)) return;
@@ -511,8 +441,8 @@ export default function spacexai(pi: ExtensionAPI) {
 		return stripForbiddenCompletionsTools(event.payload);
 	});
 
-	// Grok Build WebSearchClient: POST /v1/responses with hosted web_search.
-	// X/Twitter is a separate tool (x_search), matching grok-4.6 Agent Tools.
+	// POST /v1/responses with hosted web_search. X is a separate x_search tool.
+	// Fallback model is grok-4.7 when the session is not already on an xAI model.
 	pi.registerTool({
 		name: "web_search",
 		label: "Web Search",
@@ -551,18 +481,28 @@ export default function spacexai(pi: ExtensionAPI) {
 						"Include image results. The answer may contain Markdown image embeds.",
 				}),
 			),
+			max_turns: Type.Optional(
+				Type.Integer({
+					minimum: 1,
+					description:
+						"Cap how many agentic tool-calling turns this search may take.",
+				}),
+			),
 		}),
 		async execute(_id, p, signal, _u, ctx) {
-			const result = await runXaiWebSearch(
+			const result = await runXaiAgentSearch(
 				ctx,
 				p.query,
-				{
-					allowedDomains: p.allowed_domains,
-					excludedDomains: p.excluded_domains,
-					enableImageUnderstanding: p.enable_image_understanding,
-					enableImageSearch: p.enable_image_search,
-				},
+				[
+					buildWebSearchTool({
+						allowedDomains: p.allowed_domains,
+						excludedDomains: p.excluded_domains,
+						enableImageUnderstanding: p.enable_image_understanding,
+						enableImageSearch: p.enable_image_search,
+					}),
+				],
 				signal,
+				p.max_turns,
 			);
 			const cites = result.citations.length
 				? `\n\nCitations:\n${result.citations.map((u) => `- ${u}`).join("\n")}`
@@ -579,13 +519,12 @@ export default function spacexai(pi: ExtensionAPI) {
 		},
 	});
 
-	// Grok 4.6 hosted x_search (supports_backend_search). Same Completions
-	// workaround: function tool → POST /v1/responses with { type: "x_search" }.
+	// Hosted x_search on POST /v1/responses. Chat Completions cannot carry it.
 	pi.registerTool({
 		name: "x_search",
 		label: "X Search",
 		description:
-			"Search X (Twitter) posts, users, and threads. Grok 4.6 Agent Tool. Use for live posts, accounts, or conversations on X.",
+			"Search X (Twitter) posts, users, and threads with the xAI x_search tool. Use for live posts, accounts, or conversations on X.",
 		promptSnippet: "Search X with x_search",
 		promptGuidelines: [
 			"Use x_search when the user wants posts, accounts, or threads on X/Twitter.",
@@ -597,12 +536,14 @@ export default function spacexai(pi: ExtensionAPI) {
 			}),
 			from_date: Type.Optional(
 				Type.String({
-					description: "Inclusive start date (YYYY-MM-DD).",
+					description:
+						"Inclusive start date (YYYY-MM-DD), from 00:00 UTC. Other formats are ignored by the API.",
 				}),
 			),
 			to_date: Type.Optional(
 				Type.String({
-					description: "Inclusive end date (YYYY-MM-DD).",
+					description:
+						"Exclusive end date (YYYY-MM-DD). Posts are included up to but not including this date. For one day, set to_date to the next day.",
 				}),
 			),
 			allowed_x_handles: Type.Optional(
@@ -619,27 +560,41 @@ export default function spacexai(pi: ExtensionAPI) {
 						"Skip posts from these handles, without @. Cannot be combined with allowed_x_handles.",
 				}),
 			),
+			enable_image_understanding: Type.Optional(
+				Type.Boolean({
+					description: "Let the model look at images in the posts it finds.",
+				}),
+			),
+			enable_video_understanding: Type.Optional(
+				Type.Boolean({
+					description:
+						"Let the model watch videos in the posts it finds. X Search only.",
+				}),
+			),
+			max_turns: Type.Optional(
+				Type.Integer({
+					minimum: 1,
+					description:
+						"Cap how many agentic tool-calling turns this search may take.",
+				}),
+			),
 		}),
 		async execute(_id, p, signal, _u, ctx) {
-			if (p.allowed_x_handles?.length && p.excluded_x_handles?.length) {
-				throw new Error(
-					"allowed_x_handles and excluded_x_handles cannot be set together",
-				);
-			}
-			const tool: Record<string, unknown> = { type: "x_search" };
-			if (p.from_date) tool.from_date = p.from_date;
-			if (p.to_date) tool.to_date = p.to_date;
-			if (p.allowed_x_handles?.length) {
-				tool.allowed_x_handles = p.allowed_x_handles
-					.slice(0, 20)
-					.map((handle) => handle.replace(/^@/, ""));
-			}
-			if (p.excluded_x_handles?.length) {
-				tool.excluded_x_handles = p.excluded_x_handles
-					.slice(0, 20)
-					.map((handle) => handle.replace(/^@/, ""));
-			}
-			const result = await runXaiAgentSearch(ctx, p.query, [tool], signal);
+			const tool = buildXSearchTool({
+				fromDate: p.from_date,
+				toDate: p.to_date,
+				allowedHandles: p.allowed_x_handles,
+				excludedHandles: p.excluded_x_handles,
+				enableImageUnderstanding: p.enable_image_understanding,
+				enableVideoUnderstanding: p.enable_video_understanding,
+			});
+			const result = await runXaiAgentSearch(
+				ctx,
+				p.query,
+				[tool],
+				signal,
+				p.max_turns,
+			);
 			const cites = result.citations.length
 				? `\n\nCitations:\n${result.citations.map((u) => `- ${u}`).join("\n")}`
 				: "";
@@ -673,19 +628,10 @@ export default function spacexai(pi: ExtensionAPI) {
 		"5:2",
 		"auto",
 	] as const);
-	const aspectVideo = literalUnion([
-		"1:1",
-		"16:9",
-		"9:16",
-		"4:3",
-		"3:4",
-		"3:2",
-		"2:3",
-	] as const);
+	const aspectVideo = literalUnion(VIDEO_ASPECT_RATIOS);
 	const imageCommon = {
 		model: Type.String({
-			description:
-				"grok-imagine-image, grok-imagine-image-quality (retired 2026-11-02; served as grok-imagine-image-2.0 quality low), or grok-imagine-image-2.0",
+			description: `grok-imagine-image or ${IMAGE_MODEL_2}. grok-imagine-image-quality and grok-imagine-image-pro are accepted and rewritten to ${IMAGE_MODEL_2} (quality low when quality is omitted).`,
 		}),
 		prompt: Type.String(),
 		aspect_ratio: Type.Optional(aspectImage),
@@ -735,10 +681,72 @@ export default function spacexai(pi: ExtensionAPI) {
 				{ description: "Optional storage configuration for generated files" },
 			),
 		),
+		deferred: Type.Optional(
+			Type.Boolean({
+				description:
+					"Return immediately and poll GET /v1/images/{request_id}. Only response_format url (the default) is supported.",
+			}),
+		),
 		outputPath: Type.String({
 			description: "Required destination filename; numbered when n > 1",
 		}),
 	};
+	async function pollImageJob(
+		ctx: ExtensionContext,
+		requestId: string,
+		signal?: AbortSignal,
+	): Promise<any> {
+		for (;;) {
+			if (signal?.aborted) throw new Error("Cancelled");
+			const response = await fetch(
+				`${API_BASE}/images/${encodeURIComponent(requestId)}`,
+				{
+					signal,
+					headers: { Authorization: `Bearer ${await bearer(ctx)}` },
+				},
+			);
+			const data: any = await response.json().catch(() => ({}));
+			if (data.status === "done") return data;
+			if (data.status === "failed") {
+				throw new Error(
+					`Image ${data.status}: ${data.error?.code ?? "error"}: ${data.error?.message ?? "unknown error"}`,
+				);
+			}
+			if (!response.ok && response.status !== 202) {
+				throw new Error(
+					`SpaceXAI image poll failed (${response.status}): ${data.error?.message ?? response.statusText}`,
+				);
+			}
+			await new Promise((resolve) => setTimeout(resolve, 5000));
+		}
+	}
+	async function submitImage(
+		ctx: ExtensionContext,
+		path: string,
+		body: Record<string, unknown>,
+		outputPath: string,
+		signal?: AbortSignal,
+	) {
+		const request = normalizeImageRequest(body);
+		if (request.deferred === true) {
+			const started = await jsonPost(ctx, path, request, signal);
+			if (!started?.request_id) {
+				throw new Error("Deferred image request returned no request_id");
+			}
+			return imageResult(
+				ctx,
+				await pollImageJob(ctx, started.request_id, signal),
+				outputPath,
+				signal,
+			);
+		}
+		return imageResult(
+			ctx,
+			await jsonPost(ctx, path, request, signal),
+			outputPath,
+			signal,
+		);
+	}
 	async function imageInputRef(
 		ctx: ExtensionContext,
 		value: string,
@@ -758,12 +766,7 @@ export default function spacexai(pi: ExtensionAPI) {
 		}),
 		async execute(_id, p, signal, _u, ctx) {
 			const { outputPath, ...body } = p;
-			return imageResult(
-				ctx,
-				await jsonPost(ctx, "/images/generations", body, signal),
-				outputPath,
-				signal,
-			);
+			return submitImage(ctx, "/images/generations", body, outputPath, signal);
 		},
 	});
 	pi.registerTool({
@@ -777,6 +780,7 @@ export default function spacexai(pi: ExtensionAPI) {
 			images: Type.Optional(
 				Type.Array(Type.String(), { minItems: 1, maxItems: 5 }),
 			),
+			n: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
 		}),
 		async execute(_id, p, signal, _u, ctx) {
 			if (!exactlyOneDefined(p.image, p.images))
@@ -788,12 +792,7 @@ export default function spacexai(pi: ExtensionAPI) {
 				body.images = await Promise.all(
 					images.map(async (x: string) => await imageInputRef(ctx, x)),
 				);
-			return imageResult(
-				ctx,
-				await jsonPost(ctx, "/images/edits", body, signal),
-				outputPath,
-				signal,
-			);
+			return submitImage(ctx, "/images/edits", body, outputPath, signal);
 		},
 	});
 
@@ -806,8 +805,14 @@ export default function spacexai(pi: ExtensionAPI) {
 	);
 	const videoModel = Type.String({
 		description:
-			"grok-imagine-video, grok-imagine-video-1.5, or grok-imagine-video-1.5-lite. 1080p, voices, last_frame, and keyframes need 1.5 (reference-to-video stays 720p).",
+			"grok-imagine-video, grok-imagine-video-1.5, or grok-imagine-video-1.5-lite. Native 1080p, voices, last_frame, and keyframes need 1.5. 1.5-lite reaches 1080p by upscaling 720p for text-to-video and image-to-video. Reference-to-video stays 720p. Video edit and extend require grok-imagine-video.",
 	});
+	const generateAudio = Type.Optional(
+		Type.Boolean({
+			description:
+				"Include a generated audio track. Defaults to true. Set false for a silent video.",
+		}),
+	);
 	const videoStorage = imageCommon.storage_options;
 	async function pictureRef(
 		ctx: ExtensionContext,
@@ -837,13 +842,14 @@ export default function spacexai(pi: ExtensionAPI) {
 		name: "text_to_video",
 		label: "Grok Imagine Text-to-Video",
 		description:
-			"Grok Imagine: generate a video from a text prompt. Duration 1–15s (default 8). grok-imagine-video-1.5 supports native 1080p.",
+			"Grok Imagine: generate a video from a text prompt. Duration 1–15s (default 8). grok-imagine-video-1.5 renders 1080p natively. grok-imagine-video-1.5-lite reaches 1080p by upscaling 720p. grok-imagine-video stops at 720p. Audio is on unless generate_audio is false.",
 		parameters: Type.Object({
 			model: videoModel,
 			prompt: Type.String(),
 			duration: Type.Optional(Type.Number({ minimum: 1, maximum: 15 })),
 			aspect_ratio: Type.Optional(aspectVideo),
 			resolution: videoResolution,
+			generate_audio: generateAudio,
 			storage_options: videoStorage,
 			outputPath: Type.String({
 				description: "Required destination video filename",
@@ -859,7 +865,7 @@ export default function spacexai(pi: ExtensionAPI) {
 		name: "image_to_video",
 		label: "Grok Imagine Image-to-Video",
 		description:
-			"Grok Imagine: animate a source image. The image is frame 1. On grok-imagine-video-1.5, last_frame pins the closing frame (interpolation). Aspect ratio follows the source image unless last_frame is set. 1080p is native on 1.5.",
+			"Grok Imagine: animate a source image. The image is frame 1 and aspect_ratio is ignored (the clip matches the still). On grok-imagine-video-1.5, last_frame pins the closing frame and the request becomes reference-to-video. 1080p is native on 1.5 and upscaled from 720p on 1.5-lite.",
 		parameters: Type.Object({
 			model: videoModel,
 			image: Type.String({
@@ -878,6 +884,7 @@ export default function spacexai(pi: ExtensionAPI) {
 			duration: Type.Optional(Type.Number({ minimum: 1, maximum: 15 })),
 			aspect_ratio: Type.Optional(aspectVideo),
 			resolution: videoResolution,
+			generate_audio: generateAudio,
 			storage_options: videoStorage,
 			outputPath: Type.String({
 				description: "Required destination video filename",
@@ -899,7 +906,7 @@ export default function spacexai(pi: ExtensionAPI) {
 		name: "reference_to_video",
 		label: "Grok Imagine Reference-to-Video",
 		description:
-			"Grok Imagine: video from reference images and/or preset voices. On grok-imagine-video-1.5, image pins frame 1, last_frame pins the end, and keyframes (max 4) pin interior frames. Tag images <IMAGE_0>… and voices <AUDIO_0>… in the prompt. If image is set, references start at <IMAGE_1>. Max 7 images, 3 voices, 720p. Prompt is optional when a frame is pinned.",
+			"Grok Imagine: video from reference images and/or preset voices. On grok-imagine-video-1.5, image pins frame 1, last_frame pins the end, and keyframes (max 4) pin interior frames. Tag images <IMAGE_0>… and voices <AUDIO_0>… in the prompt. If image is set, references start at <IMAGE_1>. Up to 14 images on 1.5 (7 on grok-imagine-video), 3 voices, 720p. grok-imagine-video reference clips are capped at 10 seconds. 1.5-lite does not support this mode. Prompt is optional when a frame is pinned.",
 		parameters: Type.Object({
 			model: videoModel,
 			prompt: Type.Optional(Type.String()),
@@ -914,7 +921,7 @@ export default function spacexai(pi: ExtensionAPI) {
 				}),
 			),
 			reference_images: Type.Optional(
-				Type.Array(Type.String(), { maxItems: 7 }),
+				Type.Array(Type.String(), { maxItems: MAX_REFERENCE_IMAGES }),
 			),
 			reference_audios: Type.Optional(
 				Type.Array(
@@ -938,6 +945,7 @@ export default function spacexai(pi: ExtensionAPI) {
 			duration: Type.Optional(Type.Number({ minimum: 1, maximum: 15 })),
 			aspect_ratio: Type.Optional(aspectVideo),
 			resolution: videoResolution,
+			generate_audio: generateAudio,
 			storage_options: videoStorage,
 			outputPath: Type.String({
 				description: "Required destination video filename",
@@ -1014,7 +1022,7 @@ export default function spacexai(pi: ExtensionAPI) {
 		name: "video_edit",
 		label: "Grok Imagine Video Edit",
 		description:
-			"Grok Imagine: edit a video with a text prompt. Input must be an mp4 (URL, data URI, file ID, or local path).",
+			"Grok Imagine: edit a video with a text prompt using grok-imagine-video. 1.5 and 1.5-lite do not edit. Input must be an mp4 (URL, data URI, file ID, or local path). Duration and resolution follow the source, capped at 8.7 seconds and 720p.",
 		parameters: Type.Object({
 			model: videoModel,
 			prompt: Type.String(),
@@ -1039,7 +1047,7 @@ export default function spacexai(pi: ExtensionAPI) {
 		name: "video_extend",
 		label: "Grok Imagine Video Extension",
 		description:
-			"Grok Imagine: continue a video from its last frame. The new segment is 2–10 seconds (default 6). Input must be an mp4 between 2 and 15 seconds.",
+			"Grok Imagine: continue a video from its last frame using grok-imagine-video. 1.5 and 1.5-lite do not extend. The new segment is 2–10 seconds (default 6). Input must be an mp4 between 2 and 15 seconds.",
 		parameters: Type.Object({
 			model: videoModel,
 			prompt: Type.String(),
@@ -1086,10 +1094,16 @@ export default function spacexai(pi: ExtensionAPI) {
 				literalUnion([32000, 64000, 96000, 128000, 192000] as const),
 			),
 			optimize_streaming_latency: Type.Optional(
-				literalUnion(["0", "1"] as const),
+				literalUnion(["0", "1", "2"] as const),
 			),
 			text_normalization: Type.Optional(Type.Boolean()),
 			with_timestamps: Type.Optional(Type.Boolean()),
+			replace: Type.Optional(
+				Type.Record(Type.String(), Type.String(), {
+					description:
+						"Pronunciation map applied before synthesis. Keys are whole words (letters, digits, apostrophes, spaces). Values may be respellings or /IPA/. Up to 200 entries.",
+				}),
+			),
 			outputPath: Type.String({
 				description: "Required audio destination path, including filename",
 			}),
@@ -1106,14 +1120,13 @@ export default function spacexai(pi: ExtensionAPI) {
 				bit_rate,
 				...fields
 			} = p;
-			const body: any = {
+			const body = buildTtsBody({
 				...fields,
-				output_format: {
-					...(codec === undefined ? {} : { codec }),
-					...(sample_rate === undefined ? {} : { sample_rate }),
-					...(bit_rate === undefined ? {} : { bit_rate }),
-				},
-			};
+				codec,
+				sample_rate,
+				bit_rate,
+				includeEmptyOutputFormat: true,
+			});
 			const response = await api(
 				ctx,
 				"/tts",
@@ -1181,6 +1194,11 @@ export default function spacexai(pi: ExtensionAPI) {
 				Type.Array(Type.String({ maxLength: 50 }), { maxItems: 100 }),
 			),
 			filler_words: Type.Optional(Type.Boolean()),
+			model: Type.Optional(
+				Type.String({
+					description: `Speech-to-text model. Defaults to ${STT_MODEL}. grok-voice-transcribe-1.0 is rewritten to that model.`,
+				}),
+			),
 			vad_threshold: Type.Optional(
 				Type.Number({
 					minimum: 0,
@@ -1197,8 +1215,14 @@ export default function spacexai(pi: ExtensionAPI) {
 			if (!exactlyOneDefined(p.file, p.url))
 				throw new Error("Provide exactly one of file or url");
 			const form = new FormData();
+			form.append("model", resolveSttModel(p.model));
 			for (const [key, value] of Object.entries(p)) {
-				if (key === "file" || key === "outputPath" || value === undefined)
+				if (
+					key === "file" ||
+					key === "outputPath" ||
+					key === "model" ||
+					value === undefined
+				)
 					continue;
 				if (key === "keyterm")
 					for (const term of value as string[]) form.append("keyterm", term);
@@ -1243,7 +1267,8 @@ export default function spacexai(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "list_speech_voices",
 		label: "List Speech Voices",
-		description: "List voices available for text-to-speech.",
+		description:
+			"List built-in TTS voices and this team's custom voices.",
 		promptSnippet: "List available speech voices",
 		parameters: Type.Object({}),
 		async execute(_id, _params, signal, _update, ctx) {
@@ -1255,7 +1280,34 @@ export default function spacexai(pi: ExtensionAPI) {
 				throw new Error(
 					`Could not list SpaceXAI voices (${response.status}): ${await parseError(response)}`,
 				);
-			const data = await response.json();
+			const builtin = await response.json();
+			const customVoices: unknown[] = [];
+			let customError: string | undefined;
+			try {
+				let token: string | undefined;
+				for (let page = 0; page < 20; page++) {
+					const url = new URL(`${API_BASE}/custom-voices`);
+					url.searchParams.set("limit", "100");
+					if (token) url.searchParams.set("pagination_token", token);
+					const custom = await fetch(url, {
+						headers: { Authorization: `Bearer ${await bearer(ctx)}` },
+						signal,
+					});
+					if (!custom.ok) {
+						customError = `GET /v1/custom-voices failed (${custom.status})`;
+						break;
+					}
+					const parsed = customVoicePage(await custom.json());
+					customVoices.push(...parsed.voices);
+					if (!parsed.next) break;
+					token = parsed.next;
+				}
+			} catch (error) {
+				customError =
+					error instanceof Error ? error.message : String(error);
+			}
+			const data = mergeVoiceCatalog(builtin, customVoices);
+			if (customError) data.custom_voices_error = customError;
 			return {
 				content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
 				details: data,
@@ -1452,22 +1504,13 @@ export default function spacexai(pi: ExtensionAPI) {
 		);
 	}
 
-	function buildSttWsUrl(language: string): string {
-		let url: URL;
-		try {
-			url = new URL(STT_WS_BASE);
-		} catch (error) {
-			throw new Error(
-				`Invalid STT websocket base URL: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		}
-		url.searchParams.set("sample_rate", String(STT_SAMPLE_RATE));
-		url.searchParams.set("encoding", "pcm");
-		url.searchParams.set("interim_results", "true");
-		url.searchParams.set("language", language);
+	function pttSttUrl(language: string): string {
 		// PTT finalizes explicitly on release; keep endpointing short for chunk finals while held.
-		url.searchParams.set("endpointing", "300");
-		return url.toString();
+		return buildSttWsUrl({
+			sampleRate: STT_SAMPLE_RATE,
+			language,
+			endpointingMs: 300,
+		});
 	}
 
 	async function pickPcmRecorder(): Promise<{
@@ -1549,7 +1592,7 @@ export default function spacexai(pi: ExtensionAPI) {
 				reject(new Error("Cancelled"));
 				return;
 			}
-			const ws = new WebSocket(buildSttWsUrl(language), {
+			const ws = new WebSocket(pttSttUrl(language), {
 				headers: { Authorization: `Bearer ${token}` },
 			} as any);
 

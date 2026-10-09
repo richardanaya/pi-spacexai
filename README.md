@@ -17,13 +17,13 @@ At request time, tokens come from pi’s model registry (`getApiKeyForProvider("
 Generate and edit images, or create, edit, and extend videos without leaving the coding harness. Requests expose the documented Grok Imagine controls rather than hiding them behind simplified presets:
 
 - Text-to-image and image editing with up to five source images (grok-imagine-image-2.0 supports up to 5; older models may reject >3)
-- Full support for **grok-imagine-image-2.0** with `quality` (`low`, `medium`, or `auto`), `1k` / `1.5k` / `2k`, and aspect ratios through `21:9` and `5:2`
+- Full support for **grok-imagine-image-2.0** with `quality` (`low`, `medium`, or `auto`), `1k` / `1.5k` / `2k`, and aspect ratios through `21:9` and `5:2`. Retired slugs `grok-imagine-image-quality` and `grok-imagine-image-pro` are rewritten to 2.0.
 - Optional `storage_options` for server-side file storage with custom filenames, expiry times, and public URLs
 - 1–10 image variations, every supported aspect ratio, and 1K/2K resolution
 - Correct Files API `file_id` handling for image edits
 - Text-to-video, image-to-video, and reference-to-video (separate tools, matching Grok Build names)
-- On **grok-imagine-video-1.5**: native 1080p for text-to-video and image-to-video, preset voices (`reference_audios`), a pinned `last_frame`, and up to four interior `keyframes`
-- Exact video duration control in seconds, aspect ratio, and 480p/720p/1080p resolution
+- On **grok-imagine-video-1.5**: native 1080p for text-to-video and image-to-video, up to 14 reference images, preset voices (`reference_audios`), a pinned `last_frame`, and up to four interior `keyframes`. **1.5-lite** reaches 1080p by upscaling 720p and does not take references or pinned frames
+- Exact video duration control in seconds, aspect ratios through `21:9` and `5:2`, 480p/720p/1080p resolution, and optional `generate_audio`
 - Video editing and 2–10 second extensions, including Files API `file_id` inputs and optional `storage_options`
 - Automatic job polling, output downloading, and explicit destination paths
 
@@ -51,10 +51,10 @@ Push-to-talk needs a terminal with **Kitty keyboard protocol** key-release event
 
 Pi’s built-in xAI provider uses **Chat Completions**. Hosted Agent Tools (`{ type: "web_search" }`) and Live Search both fail on that wire (422 / 410). This extension does not switch the chat transport.
 
-Instead it registers client-side function tools that call those Agent Tools on `/v1/responses` (same workaround as Grok Build’s WebSearchClient, because pi’s chat turn is still Completions):
+Instead it registers client-side function tools that call those Agent Tools on `/v1/responses` (pi’s chat turn is still Completions). When the session is not already on an xAI model, the fallback is **`grok-4.7`**. Requests set `reasoning.effort` to `low` so the default high effort does not stall the tool, and they set `temperature` without `top_p`.
 
-- `web_search` — public web only (`{ type: "web_search" }`). Optional `allowed_domains` or `excluded_domains` (max 5, not both), `enable_image_understanding`, and `enable_image_search`.
-- `x_search` — X/Twitter only (`{ type: "x_search" }`). Optional inclusive `from_date` / `to_date`, and `allowed_x_handles` or `excluded_x_handles` (max 20, not both).
+- `web_search` — public web only (`{ type: "web_search" }`). Optional `allowed_domains` or `excluded_domains` (max 5, not both), `enable_image_understanding`, `enable_image_search`, and `max_turns`.
+- `x_search` — X/Twitter only (`{ type: "x_search" }`). `from_date` is inclusive from 00:00 UTC. `to_date` is exclusive (posts before that date; set it to the next day to cover one day). Optional `allowed_x_handles` or `excluded_x_handles` (max 20, not both), `enable_image_understanding`, `enable_video_understanding`, and `max_turns`.
 
 ### 7. Realtime voice (`/realtime-voice-start`)
 
@@ -139,16 +139,16 @@ Select Grok models with `/model` under provider **`xai`** (built into pi).
 
 ## REST media tools
 
-- `image_gen`: model (`grok-imagine-image`, `grok-imagine-image-quality`, or `grok-imagine-image-2.0`), prompt, 1–10 images, every documented aspect ratio (including `21:9` and `5:2`), `1k`/`1.5k`/`2k` resolution, optional `quality` (`low`/`medium`/`auto`, 2.0 only; omit or `auto` lets the service choose), optional `storage_options` (filename, expiry, public_url), URL/base64 response, and a required output path. After November 2, 2026, `grok-imagine-image-quality` is served as `grok-imagine-image-2.0` with `quality: "low"`.
-- `image_edit`: single or up to five source images (grok-imagine-image-2.0 supports up to 5; older models may reject >3), all documented edit options including `quality` (2.0 only) and `storage_options`, correct `file_id` handling for Files API inputs, and a required output path.
-- `text_to_video`: prompt → video (`grok-imagine-video`, `grok-imagine-video-1.5`, or `grok-imagine-video-1.5-lite`), duration 1–15s, aspect ratio, 480p/720p/1080p. 1080p is native on 1.5. Optional `storage_options`. Polls until completion and downloads to a required output path.
-- `image_to_video`: single source image → video (optional prompt, duration, resolution, optional `last_frame` on 1.5). `file_id` inputs use the Files API shape. Polls until completion and downloads to a required output path.
-- `reference_to_video`: up to 7 reference images, up to 3 preset voices (`reference_audios[].voice_id`, tag `<AUDIO_0>`), optional first-frame `image`, `last_frame`, and up to 4 `keyframes` (`timestamp_s` strictly inside the clip). At least one reference or pin is required. Prompt is required unless a frame is pinned. Resolution cap for this mode is 720p. Partner-only custom audio clips can be passed as `reference_audios[].audio`.
-- `video_edit`: prompt and an mp4 (`url` or `file_id`). Optional `storage_options`. It polls until completion.
-- `video_extend`: prompt and an mp4, optional 2–10 second extension duration (default 6), optional `storage_options`. The source video must be 2–15 seconds. It polls until completion.
-- `text_to_speech`: text up to 60,000 characters, language, voice, speed, codec, sample rate, MP3 bit rate, latency optimization (`0` or `1`), normalization, timestamps, and a required `outputPath`. The tool only saves audio and does not play it. Timestamp envelopes can be saved separately.
-- `speech_to_text`: file or URL transcription with raw format/sample rate, language/formatting, multichannel/channels, diarization, repeatable keyterms, filler words, and `vad_threshold` (0–1).
-- `list_speech_voices`: list available built-in and custom voices.
+- `image_gen`: model (`grok-imagine-image` or `grok-imagine-image-2.0`), prompt, 1–10 images, every documented aspect ratio (including `21:9` and `5:2`), `1k`/`1.5k`/`2k` resolution, optional `quality` (`low`/`medium`/`auto`, 2.0 only; omit or `auto` lets the service choose), optional `deferred` polling of `GET /v1/images/{request_id}` (URL responses only), optional `storage_options` (filename, expiry, public_url), URL/base64 response, and a required output path. `grok-imagine-image-quality` and `grok-imagine-image-pro` are accepted and rewritten to `grok-imagine-image-2.0` with `quality: "low"` when `quality` is omitted.
+- `image_edit`: single or up to five source images (grok-imagine-image-2.0 supports up to 5; older models may reject >3), the same model rewrite, `quality`, `n` (1–10), `deferred`, and `storage_options`, correct `file_id` handling for Files API inputs, and a required output path.
+- `text_to_video`: prompt → video (`grok-imagine-video`, `grok-imagine-video-1.5`, or `grok-imagine-video-1.5-lite`), duration 1–15s, aspect ratio (including `21:9` and `5:2`), 480p/720p/1080p, optional `generate_audio` (default on). 1080p is native on 1.5 and upscaled from 720p on 1.5-lite. `grok-imagine-video` stops at 720p. Optional `storage_options`. Polls until completion and downloads to a required output path.
+- `image_to_video`: single source image → video (optional prompt, duration, resolution, optional `generate_audio`, optional `last_frame` on 1.5). `aspect_ratio` is ignored; the clip matches the still. `last_frame` turns the request into reference-to-video with a pinned first frame. `file_id` inputs use the Files API shape. Polls until completion and downloads to a required output path.
+- `reference_to_video`: up to 14 reference images on 1.5 (7 on `grok-imagine-video`), up to 3 preset voices (`reference_audios[].voice_id`, tag `<AUDIO_0>`), optional first-frame `image`, `last_frame`, up to 4 `keyframes` (`timestamp_s` strictly inside the clip), and optional `generate_audio`. At least one reference or pin is required. Prompt is required unless a frame is pinned. Resolution cap for this mode is 720p. `grok-imagine-video` reference clips are capped at 10 seconds. 1.5-lite does not support this mode. Partner-only custom audio clips can be passed as `reference_audios[].audio`.
+- `video_edit`: prompt and an mp4 (`url` or `file_id`) on `grok-imagine-video`. 1.5 and 1.5-lite do not edit. Optional `storage_options`. It polls until completion. Output duration and resolution follow the source, capped at 8.7 seconds and 720p.
+- `video_extend`: prompt and an mp4 on `grok-imagine-video`, optional 2–10 second extension duration (default 6), optional `storage_options`. The source video must be 2–15 seconds. It polls until completion.
+- `text_to_speech`: text up to 60,000 characters, language, voice, speed, codec, sample rate, MP3 bit rate, latency optimization (`0`, `1`, or `2`), an optional `replace` pronunciation map, normalization, timestamps, and a required `outputPath`. The tool only saves audio and does not play it. Timestamp envelopes can be saved separately.
+- `speech_to_text`: file or URL transcription with raw format/sample rate, language/formatting, multichannel/channels, diarization, repeatable keyterms, filler words, `vad_threshold` (0–1), and `model` (default `grok-voice-transcribe-2.0`; `grok-voice-transcribe-1.0` is rewritten to 2.0).
+- `list_speech_voices`: list built-in voices from `GET /v1/tts/voices` and this team's custom voices from `GET /v1/custom-voices`.
 
 Media inputs accept HTTP(S) URLs, data URIs, Files API IDs (`file_...` → correct `file_id` shape), or local paths (an optional leading `@` is stripped). Relative paths resolve from pi's current working directory. Local image/video inputs are encoded as data URIs. Output directories are created automatically. Temporary image/video URLs should be downloaded promptly using `outputPath`.
 
@@ -184,4 +184,4 @@ Ctrl+Shift+V                 # toggle the realtime voice sidebar
 
 Playback requires `ffplay` from FFmpeg. TTS text is limited to 60,000 characters. `/set-speaking-style` stores a persistent style description and injects it into the system prompt so responses are written for that delivery; `/remove-speaking-style` clears it. Slash-command configuration is stored at `~/.pi/spacexai.json` with user-only permissions.
 
-Voice input streams raw PCM16 mono @ 16 kHz over `wss://api.x.ai/v1/stt` (`interim_results=true`). On release the client sends `finalize` then `audio.done` and uses the resulting transcript. Local recorder preference: **arecord** (ALSA raw PCM on Linux), then **ffmpeg** (stdout s16le). Auth is the same xAI bearer from pi’s model registry.
+Voice input streams raw PCM16 mono @ 16 kHz over `wss://api.x.ai/v1/stt` (`model=grok-voice-transcribe-2.0`, `interim_results=true`). On release the client sends `finalize` then `audio.done` and uses the resulting transcript. Local recorder preference: **arecord** (ALSA raw PCM on Linux), then **ffmpeg** (stdout s16le). Auth is the same xAI bearer from pi’s model registry.
