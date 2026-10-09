@@ -19,15 +19,13 @@ export const MIN_SIDEBAR_WIDTH = 10;
 export const MAX_SIDEBAR_WIDTH = 120;
 export const DEFAULT_SIDEBAR_WIDTH = 40;
 export const VOICE_SIDEBAR_USAGE =
-	"Usage: /realtime-voice-sidebar on | off | width <10-120>";
+	"Usage: /realtime-voice-sidebar width <10-120>";
 
 export interface VoiceSidebarSettings {
-	enabled: boolean;
 	width: number;
 }
 
 export const DEFAULT_VOICE_SIDEBAR_SETTINGS: VoiceSidebarSettings = {
-	enabled: true,
 	width: DEFAULT_SIDEBAR_WIDTH,
 };
 
@@ -72,9 +70,17 @@ interface SidebarTerminal {
 	write(data: string): void;
 }
 
+export interface SidebarInputResult {
+	consume?: boolean;
+	data?: string;
+}
+
 export interface SidebarTui {
 	terminal: SidebarTerminal;
 	requestRender?: () => void;
+	addInputListener?: (listener: (data: string) => SidebarInputResult | undefined) => () => void;
+	/** Present on pi's TUI. The compositor wraps it so a sidebar wheel is handled first. */
+	handleTerminalInput?: (data: string) => void;
 }
 
 /** pi's TUI.doRender is private in the types and public at runtime. */
@@ -194,7 +200,6 @@ export function loadVoiceSidebarSettings(
 	}
 	const obj = parsed as Record<string, unknown>;
 	const settings: VoiceSidebarSettings = { ...DEFAULT_VOICE_SIDEBAR_SETTINGS };
-	if (typeof obj.enabled === "boolean") settings.enabled = obj.enabled;
 	const width = obj.width;
 	if (
 		typeof width === "number" &&
@@ -216,17 +221,11 @@ export function saveVoiceSidebarSettings(
 	chmodSync(path, 0o600);
 }
 
-export type VoiceSidebarCommand =
-	| { type: "on" }
-	| { type: "off" }
-	| { type: "width"; width: number }
-	| { type: "usage" };
+export type VoiceSidebarCommand = { type: "width"; width: number } | { type: "usage" };
 
 export function parseVoiceSidebarCommand(args: string): VoiceSidebarCommand {
 	const parts = args.trim().split(/\s+/).filter(Boolean);
 	const cmd = parts[0] ?? "";
-	if (cmd === "on") return { type: "on" };
-	if (cmd === "off") return { type: "off" };
 	if (cmd === "width") {
 		const token = parts[1] ?? "";
 		if (!/^\d+$/.test(token)) return { type: "usage" };
@@ -315,11 +314,33 @@ function transcriptRows(model: VoiceSidebarModel, width: number): string[] {
 	return rows;
 }
 
-export function renderVoiceSidebar(
+/** Rows moved per mouse-wheel notch. */
+export const TRANSCRIPT_WHEEL_ROWS = 3;
+
+export interface TranscriptLayout {
+	lines: string[];
+	/** Index of the first transcript row shown. */
+	start: number;
+	/** How many transcript rows fit under the header. */
+	room: number;
+	/** Wrapped transcript rows before the window is applied. */
+	bodyRows: number;
+	/** 0-based row of the first transcript line inside `lines`. */
+	bodyRow: number;
+	/** True when the window includes the newest row. */
+	atBottom: boolean;
+}
+
+/**
+ * `scrollStart` is the first transcript row to show.
+ * `Infinity` follows the newest lines.
+ */
+export function layoutVoiceSidebar(
 	model: VoiceSidebarModel,
 	width: number,
 	maxRows = 48,
-): string[] {
+	scrollStart = Number.POSITIVE_INFINITY,
+): TranscriptLayout {
 	const safeWidth = Math.max(1, width);
 	const limit = Math.max(1, maxRows);
 	const voice = renderVoicePanel(model, safeWidth);
@@ -328,13 +349,71 @@ export function renderVoiceSidebar(
 	const title = panelHeader("Transcript", safeWidth);
 	const room = Math.max(0, limit - head.length - title.length);
 	const body = transcriptRows(model, safeWidth);
+	const maxStart = Math.max(0, body.length - Math.max(room, 1));
+	const start =
+		body.length === 0
+			? 0
+			: Math.min(maxStart, Math.max(0, Math.floor(scrollStart)));
+	const atBottom = body.length === 0 || start >= maxStart;
+	let titleLine = title[0] ?? "";
+	if (body.length > 0 && room > 0 && (start > 0 || !atBottom)) {
+		const mark = `${start > 0 ? "↑" : ""}${atBottom ? "" : "↓"}`;
+		const label = " Transcript";
+		const gap = Math.max(1, safeWidth - visibleWidth(label) - visibleWidth(mark));
+		titleLine = bold(`${label}${" ".repeat(gap)}${mark}`);
+	}
+	const titled = [titleLine, ...title.slice(1)];
 	const transcript =
 		body.length === 0
 			? [dim(" (listening…)")]
-			: body.slice(Math.max(0, body.length - Math.max(room, 1)));
-	let lines = [...head, ...title, ...transcript];
+			: body.slice(start, start + Math.max(room, 1));
+	const bodyRow = head.length + titled.length;
+	let lines = [...head, ...titled, ...transcript];
 	if (lines.length > limit) lines = lines.slice(lines.length - limit);
-	return lines.map((line) => truncateToWidth(line, safeWidth, "", true));
+	return {
+		lines: lines.map((line) => truncateToWidth(line, safeWidth, "", true)),
+		start,
+		room,
+		bodyRows: body.length,
+		bodyRow: Math.min(bodyRow, lines.length),
+		atBottom,
+	};
+}
+
+export function renderVoiceSidebar(
+	model: VoiceSidebarModel,
+	width: number,
+	maxRows = 48,
+	scrollStart = Number.POSITIVE_INFINITY,
+): string[] {
+	return layoutVoiceSidebar(model, width, maxRows, scrollStart).lines;
+}
+
+/** SGR mouse wheel (`CSI < btn ; col ; row M`). Columns and rows are 1-based. */
+export interface WheelEvent {
+	/** -1 is up, +1 is down. */
+	delta: -1 | 1;
+	col: number;
+	row: number;
+}
+
+const SGR_MOUSE = /\x1b\[<(\d+);(\d+);(\d+)[Mm]/g;
+
+/** Pull wheel notches out of an input chunk and drop every SGR mouse report. */
+export function takeWheelEvents(data: string): { events: WheelEvent[]; rest: string } {
+	const events: WheelEvent[] = [];
+	const rest = data.replace(SGR_MOUSE, (match, btnRaw, colRaw, rowRaw) => {
+		const btn = Number(btnRaw);
+		const col = Number(colRaw);
+		const row = Number(rowRaw);
+		const wheel = btn & 64;
+		const axis = btn & 3;
+		if (wheel && (axis === 0 || axis === 1) && col > 0 && row > 0) {
+			events.push({ delta: axis === 0 ? -1 : 1, col, row });
+		}
+		return "";
+	});
+	return { events, rest };
 }
 
 /**
@@ -419,6 +498,12 @@ export class VoiceSidebarCompositor {
 	private cachedRows = 0;
 	private cachedWidth = 0;
 	private cacheValid = false;
+	/** First transcript row. Ignored while `transcriptFollow` is set. */
+	private transcriptStart = 0;
+	private transcriptFollow = true;
+	private removeInputListener: (() => void) | null = null;
+	private originalHandleInput: ((data: string) => void) | null = null;
+	private ownsMouseTracking = false;
 
 	constructor(
 		tui: SidebarTui,
@@ -452,6 +537,25 @@ export class VoiceSidebarCompositor {
 				return sidebarLayout(readColumns(origDesc, terminal), self.preferredWidth).main;
 			},
 		});
+
+		const host = this.tui as SidebarTui & {
+			handleTerminalInput?: (data: string) => void;
+		};
+		// Fullscreen pi registers its own listener first and consumes every wheel.
+		// Wrap the input entry so a wheel over the sidebar is handled before that.
+		if (typeof host.handleTerminalInput === "function") {
+			const original = host.handleTerminalInput.bind(host);
+			this.originalHandleInput = host.handleTerminalInput;
+			host.handleTerminalInput = (data: string) => {
+				const result = self.onInput(data);
+				if (result?.consume) return;
+				original(result?.data ?? data);
+			};
+		} else if (host.addInputListener) {
+			this.ownsMouseTracking = true;
+			this.originalWrite("\x1b[?1000h\x1b[?1006h");
+			this.removeInputListener = host.addInputListener((data) => this.onInput(data));
+		}
 
 		if (typeof this.tui.doRender === "function") {
 			const originalDoRender = this.tui.doRender;
@@ -517,6 +621,23 @@ export class VoiceSidebarCompositor {
 		if (this.disposed) return;
 		this.disposed = true;
 		this.installed = false;
+		this.removeInputListener?.();
+		this.removeInputListener = null;
+		const host = this.tui as SidebarTui & {
+			handleTerminalInput?: (data: string) => void;
+		};
+		if (this.originalHandleInput) {
+			host.handleTerminalInput = this.originalHandleInput;
+			this.originalHandleInput = null;
+		}
+		if (this.ownsMouseTracking) {
+			this.ownsMouseTracking = false;
+			try {
+				this.originalWrite("\x1b[?1006l\x1b[?1000l");
+			} catch {
+				/* Shutting down must not fail because the terminal is gone. */
+			}
+		}
 		if (this.originalColumnsOwnDesc) {
 			Object.defineProperty(this.terminal, "columns", this.originalColumnsOwnDesc);
 		} else {
@@ -538,6 +659,48 @@ export class VoiceSidebarCompositor {
 		return `${SIDEBAR_BG}${content}${" ".repeat(padding)}${BG_RESET}`;
 	}
 
+	private onInput(data: string): SidebarInputResult | undefined {
+		const { events } = takeWheelEvents(data);
+		if (events.length === 0 || !events.some((event) => this.wheelOverSidebar(event))) {
+			return undefined;
+		}
+		let scrolled = false;
+		for (const event of events) {
+			if (this.wheelOverSidebar(event) && this.scrollTranscript(event)) scrolled = true;
+		}
+		if (scrolled) this.paint();
+		return { consume: true };
+	}
+
+	private wheelOverSidebar(event: WheelEvent): boolean {
+		const layout = sidebarLayout(this.rawColumns(), this.preferredWidth);
+		return event.col >= layout.sidebarColumn;
+	}
+
+	private scrollTranscript(event: WheelEvent): boolean {
+		const rawRows = Math.max(0, Math.floor(Number(this.terminal.rows) || 0));
+		if (rawRows === 0) return false;
+		const layout = sidebarLayout(this.rawColumns(), this.preferredWidth);
+		const model = this.getModel();
+		const cwd = model.cwd ?? "";
+		const bodyRows = cwd ? Math.max(1, rawRows - 1) : rawRows;
+		const frame = layoutVoiceSidebar(
+			model,
+			layout.sidebar,
+			bodyRows,
+			this.transcriptFollow ? Number.POSITIVE_INFINITY : this.transcriptStart,
+		);
+		const maxStart = Math.max(0, frame.bodyRows - Math.max(frame.room, 1));
+		const next = Math.min(
+			maxStart,
+			Math.max(0, frame.start + event.delta * TRANSCRIPT_WHEEL_ROWS),
+		);
+		if (next === frame.start) return false;
+		this.transcriptStart = next;
+		this.transcriptFollow = next >= maxStart;
+		return true;
+	}
+
 	private paintInternal(forceFull: boolean, standalone: boolean): void {
 		if (this.disposed || !this.installed) return;
 		const rawRows = Math.max(0, Math.floor(Number(this.terminal.rows) || 0));
@@ -546,7 +709,12 @@ export class VoiceSidebarCompositor {
 		const model = this.getModel();
 		const cwd = model.cwd ?? "";
 		const bodyRows = cwd ? Math.max(1, rawRows - 1) : rawRows;
-		const lines = renderVoiceSidebar(model, layout.sidebar, bodyRows);
+		const lines = renderVoiceSidebar(
+			model,
+			layout.sidebar,
+			bodyRows,
+			this.transcriptFollow ? Number.POSITIVE_INFINITY : this.transcriptStart,
+		);
 
 		const home = process.env.HOME ?? "";
 		const cwdDisplay = home && cwd.startsWith(home) ? `~${cwd.slice(home.length)}` : cwd;
@@ -615,7 +783,7 @@ function readColumns(
 	return typeof raw === "number" && Number.isFinite(raw) ? Math.max(1, Math.floor(raw)) : 80;
 }
 
-/** Installs, toggles, and resizes one voice sidebar on a pi TUI. */
+/** Installs and resizes one voice sidebar on a pi TUI. */
 export class VoiceSidebarSession {
 	private tui: SidebarTui | null = null;
 	private compositor: VoiceSidebarCompositor | null = null;
@@ -629,10 +797,6 @@ export class VoiceSidebarSession {
 		this.settings = loadVoiceSidebarSettings(this.settingsPath);
 	}
 
-	get enabled(): boolean {
-		return this.settings.enabled;
-	}
-
 	get width(): number {
 		return this.settings.width;
 	}
@@ -642,17 +806,10 @@ export class VoiceSidebarSession {
 	}
 
 	bind(tui: SidebarTui): void {
-		if (this.tui === tui && (this.compositor !== null || !this.settings.enabled)) return;
+		if (this.tui === tui && this.compositor !== null) return;
 		this.unmount(false);
 		this.tui = tui;
 		this.mount();
-	}
-
-	setEnabled(enabled: boolean): void {
-		this.settings.enabled = enabled;
-		this.persist();
-		if (!enabled) this.unmount(true);
-		else this.mount();
 	}
 
 	setWidth(width: number): void {
@@ -674,7 +831,7 @@ export class VoiceSidebarSession {
 	}
 
 	private mount(): void {
-		if (!this.settings.enabled || !this.tui || this.compositor) return;
+		if (!this.tui || this.compositor) return;
 		const compositor = new VoiceSidebarCompositor(
 			this.tui,
 			this.getModel,
