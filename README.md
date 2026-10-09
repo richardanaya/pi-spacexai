@@ -79,12 +79,10 @@ What happens:
 7. Voice state is drawn in a **right-hand sidebar** (connection, voice name, microphone level, harness status, and the you/voice transcript). The chat column narrows to make room. This follows the [pi-sidebar-tui](https://github.com/bi0h4z4rd88/pi-sidebar-tui) compositor: `terminal.columns` is reduced, and the panel is painted into the rightmost columns after each TUI frame inside one synchronized update. Rows are rewritten only when their text changes.
 
 ```text
-/realtime-voice-sidebar on
-/realtime-voice-sidebar off
 /realtime-voice-sidebar width 40
 ```
 
-Ctrl+Shift+V toggles the sidebar (rebind it in `~/.pi/agent/keybindings.json`). Width is 10–120 columns and is remembered in `~/.pi/agent/spacexai-voice-sidebar.json`. Hiding the sidebar restores the full-width chat and leaves a one-line footer (`realtime · voice`, the mic meter, and harness status).
+Width is 10–120 columns and is remembered in `~/.pi/agent/spacexai-voice-sidebar.json`. Before the sidebar is mounted, a one-line footer shows `realtime · voice`, the mic meter, and harness status.
 
 Default voice is **leo**. `/realtime-voice-select` and `/spacexai-voice` write the same `~/.pi/spacexai.json` voice. Selecting a voice during a live session applies it immediately.
 
@@ -174,9 +172,7 @@ Esc                      # cancel push-to-talk and restore the editor
 /spacexai-voice eve
 /realtime-voice-start
 /realtime-voice-select eve
-/realtime-voice-sidebar on
 /realtime-voice-sidebar width 40
-Ctrl+Shift+V                 # toggle the realtime voice sidebar
 /realtime-voice-stop
 /set-speaking-style warm, measured, and conversational
 /remove-speaking-style

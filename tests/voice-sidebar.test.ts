@@ -144,13 +144,11 @@ test("footer is hidden while the sidebar is showing", () => {
 	assert.equal(voiceFooterLabel(model({ connected: false, notice: "" }), false), undefined);
 });
 
-test("parseVoiceSidebarCommand accepts on, off, and width 10-120", () => {
-	assert.deepEqual(parseVoiceSidebarCommand("on"), { type: "on" });
-	assert.deepEqual(parseVoiceSidebarCommand("off"), { type: "off" });
+test("parseVoiceSidebarCommand accepts width 10-120", () => {
 	assert.deepEqual(parseVoiceSidebarCommand("width 40"), { type: "width", width: 40 });
 	assert.deepEqual(parseVoiceSidebarCommand("width 10"), { type: "width", width: 10 });
 	assert.deepEqual(parseVoiceSidebarCommand("width 120"), { type: "width", width: 120 });
-	for (const args of ["", "width", "width 9", "width 121", "width 40.5", "toggle"]) {
+	for (const args of ["", "on", "off", "width", "width 9", "width 121", "width 40.5", "toggle"]) {
 		assert.equal(parseVoiceSidebarCommand(args).type, "usage");
 	}
 });
@@ -159,16 +157,16 @@ test("settings round-trip and invalid files fall back", () => {
 	const dir = mkdtempSync(join(tmpdir(), "voice-sidebar-"));
 	const path = join(dir, "settings.json");
 	try {
-		assert.equal(loadVoiceSidebarSettings(path).enabled, true);
 		assert.equal(loadVoiceSidebarSettings(path).width, 40);
-		saveVoiceSidebarSettings({ enabled: false, width: 55 }, path);
+		saveVoiceSidebarSettings({ width: 55 }, path);
 		assert.equal(statSync(path).mode & 0o777, 0o600);
-		assert.deepEqual(loadVoiceSidebarSettings(path), { enabled: false, width: 55 });
+		assert.deepEqual(loadVoiceSidebarSettings(path), { width: 55 });
 		writeFileSync(path, "{", "utf8");
 		assert.equal(loadVoiceSidebarSettings(path).width, 40);
-		writeFileSync(path, JSON.stringify({ enabled: true, width: 4 }), "utf8");
+		writeFileSync(path, JSON.stringify({ enabled: false, width: 4 }), "utf8");
 		assert.equal(loadVoiceSidebarSettings(path).width, 40);
-		assert.equal(loadVoiceSidebarSettings(path).enabled, true);
+		writeFileSync(path, JSON.stringify({ enabled: false, width: 55 }), "utf8");
+		assert.deepEqual(loadVoiceSidebarSettings(path), { width: 55 });
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -357,7 +355,7 @@ test("compositor pins the working directory on the last row", () => {
 	}
 });
 
-test("session toggles, resizes, and remembers settings", () => {
+test("session resizes and remembers settings", () => {
 	const dir = mkdtempSync(join(tmpdir(), "voice-sidebar-session-"));
 	const path = join(dir, "settings.json");
 	const { tui, renders } = fakeTui();
@@ -371,15 +369,7 @@ test("session toggles, resizes, and remembers settings", () => {
 		session.setWidth(24);
 		assert.equal(tui.terminal.columns, sidebarLayout(80, 24).main);
 		assert.equal(loadVoiceSidebarSettings(path).width, 24);
-
-		session.setEnabled(false);
-		assert.equal(session.showing, false);
-		assert.equal(tui.terminal.columns, 80);
-		assert.equal(JSON.parse(readFileSync(path, "utf8")).enabled, false);
-
-		session.setEnabled(true);
 		assert.equal(session.showing, true);
-		assert.equal(tui.terminal.columns, sidebarLayout(80, 24).main);
 
 		session.dispose();
 		assert.equal(tui.terminal.columns, 80);

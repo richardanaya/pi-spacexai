@@ -19,15 +19,13 @@ export const MIN_SIDEBAR_WIDTH = 10;
 export const MAX_SIDEBAR_WIDTH = 120;
 export const DEFAULT_SIDEBAR_WIDTH = 40;
 export const VOICE_SIDEBAR_USAGE =
-	"Usage: /realtime-voice-sidebar on | off | width <10-120>";
+	"Usage: /realtime-voice-sidebar width <10-120>";
 
 export interface VoiceSidebarSettings {
-	enabled: boolean;
 	width: number;
 }
 
 export const DEFAULT_VOICE_SIDEBAR_SETTINGS: VoiceSidebarSettings = {
-	enabled: true,
 	width: DEFAULT_SIDEBAR_WIDTH,
 };
 
@@ -200,7 +198,6 @@ export function loadVoiceSidebarSettings(
 	}
 	const obj = parsed as Record<string, unknown>;
 	const settings: VoiceSidebarSettings = { ...DEFAULT_VOICE_SIDEBAR_SETTINGS };
-	if (typeof obj.enabled === "boolean") settings.enabled = obj.enabled;
 	const width = obj.width;
 	if (
 		typeof width === "number" &&
@@ -222,17 +219,11 @@ export function saveVoiceSidebarSettings(
 	chmodSync(path, 0o600);
 }
 
-export type VoiceSidebarCommand =
-	| { type: "on" }
-	| { type: "off" }
-	| { type: "width"; width: number }
-	| { type: "usage" };
+export type VoiceSidebarCommand = { type: "width"; width: number } | { type: "usage" };
 
 export function parseVoiceSidebarCommand(args: string): VoiceSidebarCommand {
 	const parts = args.trim().split(/\s+/).filter(Boolean);
 	const cmd = parts[0] ?? "";
-	if (cmd === "on") return { type: "on" };
-	if (cmd === "off") return { type: "off" };
 	if (cmd === "width") {
 		const token = parts[1] ?? "";
 		if (!/^\d+$/.test(token)) return { type: "usage" };
@@ -790,7 +781,7 @@ function readColumns(
 	return typeof raw === "number" && Number.isFinite(raw) ? Math.max(1, Math.floor(raw)) : 80;
 }
 
-/** Installs, toggles, and resizes one voice sidebar on a pi TUI. */
+/** Installs and resizes one voice sidebar on a pi TUI. */
 export class VoiceSidebarSession {
 	private tui: SidebarTui | null = null;
 	private compositor: VoiceSidebarCompositor | null = null;
@@ -804,10 +795,6 @@ export class VoiceSidebarSession {
 		this.settings = loadVoiceSidebarSettings(this.settingsPath);
 	}
 
-	get enabled(): boolean {
-		return this.settings.enabled;
-	}
-
 	get width(): number {
 		return this.settings.width;
 	}
@@ -817,17 +804,10 @@ export class VoiceSidebarSession {
 	}
 
 	bind(tui: SidebarTui): void {
-		if (this.tui === tui && (this.compositor !== null || !this.settings.enabled)) return;
+		if (this.tui === tui && this.compositor !== null) return;
 		this.unmount(false);
 		this.tui = tui;
 		this.mount();
-	}
-
-	setEnabled(enabled: boolean): void {
-		this.settings.enabled = enabled;
-		this.persist();
-		if (!enabled) this.unmount(true);
-		else this.mount();
 	}
 
 	setWidth(width: number): void {
@@ -849,7 +829,7 @@ export class VoiceSidebarSession {
 	}
 
 	private mount(): void {
-		if (!this.settings.enabled || !this.tui || this.compositor) return;
+		if (!this.tui || this.compositor) return;
 		const compositor = new VoiceSidebarCompositor(
 			this.tui,
 			this.getModel,

@@ -1226,10 +1226,10 @@ export function registerRealtimeVoice(
 	}
 
 	function syncActivity(): void {
-		const run = Boolean(session?.connected() && sidebar.enabled);
+		const run = Boolean(session?.connected());
 		if (run && !frameTimer) {
 			frameTimer = setInterval(() => {
-				if (!session?.connected() || !sidebar.enabled) return;
+				if (!session?.connected()) return;
 				model.frame += 1;
 				refreshSidebar();
 			}, 90);
@@ -1524,8 +1524,7 @@ export function registerRealtimeVoice(
 	});
 
 	pi.registerCommand("realtime-voice-sidebar", {
-		description:
-			"Show, hide, or resize the realtime voice sidebar: on | off | width <10-120>",
+		description: "Resize the realtime voice sidebar: width <10-120>",
 		handler: async (args, ctx) => {
 			statusCtx = ctx;
 			rememberCwd(ctx);
@@ -1534,34 +1533,9 @@ export function registerRealtimeVoice(
 				ctx.ui.notify(VOICE_SIDEBAR_USAGE, "warning");
 				return;
 			}
-			if (parsed.type === "width") {
-				sidebar.setWidth(parsed.width);
-				refreshSidebar();
-				ctx.ui.notify(`Voice sidebar width set to ${parsed.width}`, "info");
-				return;
-			}
-			sidebar.setEnabled(parsed.type === "on");
-			syncActivity();
+			sidebar.setWidth(parsed.width);
 			refreshSidebar();
-			ctx.ui.notify(
-				`Voice sidebar ${parsed.type === "on" ? "enabled" : "disabled"}`,
-				"info",
-			);
-		},
-	});
-
-	pi.registerShortcut("ctrl+shift+v", {
-		description: "Toggle the realtime voice sidebar",
-		handler: async (ctx) => {
-			statusCtx = ctx;
-			rememberCwd(ctx);
-			sidebar.setEnabled(!sidebar.enabled);
-			syncActivity();
-			refreshSidebar();
-			ctx.ui.notify(
-				`Voice sidebar ${sidebar.enabled ? "enabled" : "disabled"}`,
-				"info",
-			);
+			ctx.ui.notify(`Voice sidebar width set to ${parsed.width}`, "info");
 		},
 	});
 
