@@ -6,10 +6,12 @@ import test, { mock } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	createRenderScheduler,
+	layoutVoiceSidebar,
 	loadVoiceSidebarSettings,
 	micMeter,
 	parseVoiceSidebarCommand,
 	renderVoiceSidebar,
+	takeWheelEvents,
 	saveVoiceSidebarSettings,
 	sidebarLayout,
 	VoiceSidebarCompositor,
@@ -92,6 +94,34 @@ test("renderVoiceSidebar keeps the latest transcript lines", () => {
 	assert.match(text, /Voice/);
 	assert.match(text, /utterance-11-end/);
 	assert.doesNotMatch(text, /utterance-0-end/);
+});
+
+test("renderVoiceSidebar scrolls the transcript window", () => {
+	const turns = Array.from({ length: 12 }, (_, i) => ({
+		id: `t${i}`,
+		who: "you" as const,
+		text: `utterance-${i}-end`,
+	}));
+	const state = model({ turns, harnessStatus: "" });
+	const latest = layoutVoiceSidebar(state, 36, 16);
+	assert.ok(latest.atBottom);
+	assert.match(latest.lines.map(strip).join("\n"), /utterance-11-end/);
+	const older = layoutVoiceSidebar(state, 36, 16, 0);
+	const text = older.lines.map(strip).join("\n");
+	assert.match(text, /utterance-0-end/);
+	assert.match(text, /↓/);
+	assert.equal(older.atBottom, false);
+	assert.equal(older.start, 0);
+});
+
+test("takeWheelEvents reads SGR wheel reports and drops other mouse input", () => {
+	const parsed = takeWheelEvents("a\x1b[<64;61;12M\x1b[<0;3;4M\x1b[<69;8;2m");
+	assert.deepEqual(parsed.events, [
+		{ delta: -1, col: 61, row: 12 },
+		{ delta: 1, col: 8, row: 2 },
+	]);
+	assert.equal(parsed.rest, "a");
+	assert.deepEqual(takeWheelEvents("hello").events, []);
 });
 
 test("renderVoiceSidebar empty transcript and width 1", () => {
@@ -244,6 +274,67 @@ test("compositor keeps the render frame closed when pi throws", () => {
 	tui.terminal.write("plain");
 	assert.deepEqual(writes, ["plain"]);
 	compositor.dispose();
+});
+
+test("compositor scrolls the transcript on a wheel event over that column", () => {
+	const turns = Array.from({ length: 20 }, (_, i) => ({
+		id: `t${i}`,
+		who: "you" as const,
+		text: `utterance-${i}-end`,
+	}));
+	const listeners: Array<(data: string) => { consume?: boolean; data?: string } | undefined> = [];
+	const { tui, writes } = fakeTui(80, 24);
+	tui.addInputListener = (listener) => {
+		listeners.push(listener);
+		return () => {
+			const index = listeners.indexOf(listener);
+			if (index >= 0) listeners.splice(index, 1);
+		};
+	};
+	const compositor = new VoiceSidebarCompositor(tui, () => model({ turns, cwd: "" }), 20);
+	compositor.install();
+	assert.match(writes[0] ?? "", /\x1b\[\?1000h\x1b\[\?1006h/);
+	compositor.paint();
+	const frame = layoutVoiceSidebar(model({ turns, cwd: "" }), 20, 24);
+	const col = sidebarLayout(80, 20).sidebarColumn;
+	const row = frame.bodyRow + 1;
+	const consumed = listeners[0]?.(`\x1b[<64;${col};${row}M`);
+	assert.deepEqual(consumed, { consume: true });
+	const painted = strip(writes.at(-1) ?? "");
+	assert.match(painted, /utterance-12-/);
+	assert.doesNotMatch(painted, /utterance-19-/);
+
+	const chat = listeners[0]?.(`\x1b[<65;1;${row}Mx`);
+	assert.equal(chat, undefined);
+
+	compositor.dispose();
+	assert.match(writes.at(-1) ?? "", /\x1b\[\?1006l\x1b\[\?1000l/);
+	assert.equal(listeners.length, 0);
+});
+
+test("compositor sees a sidebar wheel before fullscreen consumes it", () => {
+	const turns = Array.from({ length: 20 }, (_, i) => ({
+		id: `t${i}`,
+		who: "you" as const,
+		text: `utterance-${i}-end`,
+	}));
+	const { tui, writes } = fakeTui(80, 24);
+	let forwarded = "";
+	tui.handleTerminalInput = (data: string) => {
+		forwarded = data;
+	};
+	const compositor = new VoiceSidebarCompositor(tui, () => model({ turns, cwd: "" }), 20);
+	compositor.install();
+	assert.equal(writes.some((line) => line.includes("?1000h")), false);
+	const col = sidebarLayout(80, 20).sidebarColumn;
+	tui.handleTerminalInput?.(`\x1b[<64;${col};4M`);
+	assert.equal(forwarded, "");
+	assert.match(strip(writes.at(-1) ?? ""), /utterance-12-/);
+	tui.handleTerminalInput?.(`\x1b[<65;2;4M`);
+	assert.match(forwarded, /65;2;4/);
+	compositor.dispose();
+	tui.handleTerminalInput?.("key");
+	assert.equal(forwarded, "key");
 });
 
 test("compositor pins the working directory on the last row", () => {
