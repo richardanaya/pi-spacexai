@@ -22,8 +22,21 @@ function logVoice(line: string): void {
 		/* ignore */
 	}
 }
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
+import {
+	createRenderScheduler,
+	parseVoiceSidebarCommand,
+	setVoiceSidebarTheme,
+	voiceFooterLabel,
+	VOICE_SIDEBAR_USAGE,
+	VoiceSidebarSession,
+	type VoiceSidebarModel,
+} from "./voice-sidebar.ts";
 
 const API_BASE = "https://api.x.ai/v1";
 const REALTIME_URL = "wss://api.x.ai/v1/realtime";
@@ -45,7 +58,7 @@ type SendToObserverParams = Static<typeof sendToObserverParams>;
 const setHarnessStatusParams = Type.Object({
 	status: Type.String({
 		description:
-			'Short status text shown in the terminal while realtime voice is running. Prefer a lasting completion line like "Done: fixed auth bug" over clearing. Do not pass empty string to clear unless explicitly asked.',
+			'Short status text shown in the realtime voice sidebar. Prefer a lasting completion line like "Done: fixed auth bug" over clearing. Do not pass empty string to clear unless explicitly asked.',
 	}),
 });
 type SetHarnessStatusParams = Static<typeof setHarnessStatusParams>;
@@ -56,7 +69,7 @@ A voice observer co-pilot is in this terminal (started with /realtime-voice-star
 
 You MUST use these tools to keep the observer and user in the loop:
 - send_message_to_observer — send the outcome the voice agent should speak. This arrives as a work_landed update. Call it when a voice-requested job finishes. Bias toward the outcome, not a play-by-play.
-- set_harness_status — keep a short live status line in the terminal up to date. Set it when work starts, update it as you progress, and when finished leave a clear completion status (e.g. "Done: added login tests" or "Failed: type error in auth.ts"). Do NOT clear the status line — leave the latest completion/failure text visible. Only clear if the user explicitly asks you to.
+- set_harness_status — keep a short live status line in the realtime voice sidebar up to date. Set it when work starts, update it as you progress, and when finished leave a clear completion status (e.g. "Done: added login tests" or "Failed: type error in auth.ts"). Do NOT clear the status line — leave the latest completion/failure text visible. Only clear if the user explicitly asks you to.
 
 Do not assume the observer saw anything you only printed in the terminal. Prefer short spoken-ready messages.
 
@@ -78,8 +91,10 @@ interface RealtimeVoiceOptions {
 	};
 	/** Called when the session stops itself (idle timeout or socket close). */
 	onSelfStop?: (reason: string) => void;
-	/** Terminal status line (not spoken). */
+	/** Trouble line (idle warning, mic, or speaker). Not spoken. */
 	onStatus?: (status: string) => void;
+	/** Harness status line shown in the voice sidebar. Not spoken. */
+	onHarnessStatus?: (status: string) => void;
 	/** Mic level from 0 (silence) to 1 (loud). */
 	onLevel?: (level: number) => void;
 	/** Spoken line. Not shown in the chat. */
@@ -1145,7 +1160,7 @@ async function startRealtimeVoice(
 		sendToObserver: injectObserverMessage,
 		setHarnessStatus: (status: string) => {
 			harnessStatus = String(status ?? "").trim();
-			options.onStatus?.(harnessStatus);
+			options.onHarnessStatus?.(harnessStatus);
 			return ws.readyState === WebSocket.OPEN;
 		},
 		getHarnessStatus: () => harnessStatus,
@@ -1176,120 +1191,111 @@ export function registerRealtimeVoice(
 	let pendingReceipt: string | null = null;
 	let reportedReceipt: string | null = null;
 	let observerToolsActive = false;
-	let statusCtx: {
-		ui?: {
-			setStatus?(k: string, v: string | undefined): void;
-			notify?(m: string, l?: string): void;
-			setWidget?(
-				key: string,
-				content: string[] | undefined,
-				options?: { placement?: "aboveEditor" | "belowEditor" },
-			): void;
-			custom?<T>(
-				factory: (
-					tui: unknown,
-					theme: unknown,
-					keybindings: unknown,
-					done: (result: T) => void,
-				) => { render(width: number): string[]; invalidate(): void },
-				options?: {
-					overlay?: boolean;
-					overlayOptions?: {
-						width?: number;
-						anchor?: "top-right";
-						margin?: { top?: number; right?: number };
-						nonCapturing?: boolean;
-					};
-				},
-			): Promise<T>;
-		};
-		hasUI?: boolean;
-	} | null = null;
-	let voiceDialog: {
-		turns: { id: string; who: "you" | "voice"; text: string }[];
-		invalidate(): void;
-		render(width: number): string[];
-	} | null = null;
-	let closeVoiceDialog: (() => void) | null = null;
+	let statusCtx: ExtensionContext | null = null;
+	let widgetInstalled = false;
+	let widgetToken: object | null = null;
+	let footerShown: string | undefined;
+	let frameTimer: ReturnType<typeof setInterval> | undefined;
+	const model: VoiceSidebarModel = {
+		connected: false,
+		voice: DEFAULT_VOICE,
+		level: 0,
+		harnessStatus: "",
+		notice: "",
+		turns: [],
+		cwd: undefined,
+		frame: 0,
+	};
+	const sidebar = new VoiceSidebarSession(() => model);
+	const scheduler = createRenderScheduler(() => {
+		sidebar.paint();
+		syncFooter();
+	});
 
-	function openVoiceDialog(): void {
-		const ui = statusCtx?.ui;
-		if (!ui?.custom || voiceDialog) return;
-		const dialog = {
-			turns: [] as { id: string; who: "you" | "voice"; text: string }[],
-			invalidate() {},
-			render(width: number): string[] {
-				const inner = Math.max(8, width - 2);
-				const rows: { color: string; text: string }[] = [];
-				for (const turn of this.turns) {
-					const words = turn.text.replace(/\s+/g, " ").trim();
-					if (!words) continue;
-					const color = turn.who === "you" ? "\x1b[36m" : "\x1b[33m";
-					for (const row of wrapCaption(words, inner)) rows.push({ color, text: row });
-				}
-				const view = rows.slice(-12);
-				while (view.length < 4) view.unshift({ color: "", text: "" });
-				const lines = [
-					`┌\x1b[36myou\x1b[0m · \x1b[33mvoice\x1b[0m ${"─".repeat(Math.max(0, inner - 12))}┐`,
-				];
-				for (const row of view) {
-					const pad = " ".repeat(Math.max(0, inner - row.text.length));
-					lines.push(`│${row.color}${row.text}\x1b[0m${pad}│`);
-				}
-				lines.push(`└${"─".repeat(inner)}┘`);
-				return lines;
+	function syncFooter(): void {
+		const label = voiceFooterLabel(model, sidebar.showing);
+		if (label === footerShown) return;
+		footerShown = label;
+		if (statusCtx?.hasUI && statusCtx.ui?.setStatus) {
+			statusCtx.ui.setStatus("spacexai-realtime", label);
+		}
+	}
+
+	function refreshSidebar(): void {
+		scheduler.schedule();
+	}
+
+	function syncActivity(): void {
+		const run = Boolean(session?.connected() && sidebar.enabled);
+		if (run && !frameTimer) {
+			frameTimer = setInterval(() => {
+				if (!session?.connected() || !sidebar.enabled) return;
+				model.frame += 1;
+				refreshSidebar();
+			}, 90);
+			return;
+		}
+		if (!run && frameTimer) {
+			clearInterval(frameTimer);
+			frameTimer = undefined;
+		}
+	}
+
+	function rememberCwd(ctx: { cwd?: string }): void {
+		if (typeof ctx.cwd === "string") model.cwd = ctx.cwd;
+	}
+
+	function ensureWidget(ctx: ExtensionContext): void {
+		if (!ctx.hasUI || widgetInstalled) return;
+		const token = {};
+		widgetToken = token;
+		widgetInstalled = true;
+		ctx.ui.setWidget(
+			"spacexai-voice-sidebar",
+			(tui, theme) => {
+				setVoiceSidebarTheme(theme);
+				sidebar.bind(tui);
+				syncFooter();
+				return {
+					dispose() {
+						if (widgetToken !== token) return;
+						sidebar.dispose();
+						widgetInstalled = false;
+						widgetToken = null;
+					},
+					invalidate() {},
+					render(_width: number) {
+						return [];
+					},
+				};
 			},
-		};
-		voiceDialog = dialog;
-		void ui.custom(
-			(_tui, _theme, _keys, done) => {
-				closeVoiceDialog = () => done(undefined);
-				return dialog;
-			},
-			{
-				overlay: true,
-				overlayOptions: {
-					anchor: "top-right",
-					width: 44,
-					margin: { top: 1, right: 1 },
-					nonCapturing: true,
-				},
-			},
+			{ placement: "belowEditor" },
 		);
 	}
 
-	function dismissVoiceDialog(): void {
-		const close = closeVoiceDialog;
-		closeVoiceDialog = null;
-		voiceDialog = null;
-		close?.();
+	function dropWidget(): void {
+		scheduler.cancel();
+		widgetToken = null;
+		widgetInstalled = false;
+		sidebar.dispose();
+		statusCtx?.ui?.setWidget?.("spacexai-voice-sidebar", undefined);
+		statusCtx?.ui?.setWidget?.("spacexai-caption", undefined);
 	}
 
 	const setFooter = (label: string | undefined) => {
+		footerShown = label;
 		if (statusCtx?.hasUI && statusCtx.ui?.setStatus) {
 			statusCtx.ui.setStatus("spacexai-realtime", label);
 		}
 	};
 
-	function micMeter(level: number): string {
-		const steps = "▁▂▃▄▅▆▇█";
-		let bar = "";
-		for (let i = 0; i < 8; i++) {
-			bar += level >= (i + 1) / 8 ? steps[i] : "▁";
-		}
-		return bar;
-	}
-
-	function wrapCaption(text: string, width: number): string[] {
-		if (!text) return [];
-		const rows: string[] = [];
-		let rest = text;
-		while (rest.length > width) {
-			rows.push(rest.slice(0, width));
-			rest = rest.slice(width);
-		}
-		if (rest) rows.push(rest);
-		return rows;
+	function showCaption(who: "you" | "voice", text: string, id: string): void {
+		if (!id) return;
+		const existing = model.turns.find((turn) => turn.id === id);
+		if (existing) existing.text = text;
+		else model.turns.push({ id, who, text });
+		if (model.turns.length > 30) model.turns.splice(0, model.turns.length - 30);
+		refreshSidebar();
 	}
 
 	function enableObserverTools(): void {
@@ -1332,11 +1338,11 @@ export function registerRealtimeVoice(
 			name: "set_harness_status",
 			label: "Set Coding Harness Status",
 			description:
-				'Update the live coding-harness status text in the terminal while realtime voice is running. Use short phrases for in-progress work, and prefer a lasting completion/failure line when done (e.g. "Done: fixed flaky test"). Do not clear the status unless the user asks.',
+				'Update the live coding-harness status text in the realtime voice sidebar. Use short phrases for in-progress work, and prefer a lasting completion/failure line when done (e.g. "Done: fixed flaky test"). Do not clear the status unless the user asks.',
 			promptSnippet: "Update live harness status during realtime voice",
 			promptGuidelines: [
 				"Keep set_harness_status up to date as work starts and progresses. When work finishes, set a completion or failure status and leave it — do not clear the status line.",
-				"Status text is shown in the terminal and is not spoken. Use send_message_to_observer for spoken updates.",
+				"Status text is shown in the voice sidebar and is not spoken. Use send_message_to_observer for spoken updates.",
 			],
 			parameters: setHarnessStatusParams,
 			async execute(_id, params: SetHarnessStatusParams) {
@@ -1376,62 +1382,61 @@ export function registerRealtimeVoice(
 		pendingReceipt = null;
 		reportedReceipt = null;
 		disableObserverTools();
+		model.connected = false;
+		model.level = 0;
+		model.harnessStatus = "";
+		model.notice = "";
+		model.turns = [];
+		model.frame = 0;
+		syncActivity();
+		dropWidget();
 		setFooter(undefined);
-		statusCtx?.ui?.setWidget?.("spacexai-caption", undefined);
-		dismissVoiceDialog();
 	}
 
-	const startVoice = async (
-		_args: string,
-		ctx: {
-			ui: { notify(m: string, l?: string): void };
-			hasUI?: boolean;
-			modelRegistry: {
-				getApiKeyForProvider(provider: string): Promise<string | undefined>;
-			};
-			sessionManager: {
-				buildSessionContext(): { messages: unknown[] };
-				getSessionId?: () => string | undefined;
-				getSessionDir?: () => string | undefined;
-			};
-		},
-	) => {
+	const startVoice = async (_args: string, ctx: ExtensionCommandContext) => {
 			statusCtx = ctx;
+			rememberCwd(ctx);
 			if (session?.connected()) {
-				setFooter(`realtime · ${session.voice}`);
+				model.connected = true;
+				model.voice = session.voice;
+				ensureWidget(ctx);
+				syncActivity();
+				refreshSidebar();
 				return;
 			}
 			try {
 				const voice = (await deps.readVoice()) || DEFAULT_VOICE;
-				let level = 0;
-				const showCaption = (who: "you" | "voice", text: string, id: string) => {
-					if (!voiceDialog) openVoiceDialog();
-					if (!voiceDialog || !id) return;
-					const turns = voiceDialog.turns;
-					const existing = turns.find((turn) => turn.id === id);
-					if (existing) existing.text = text;
-					else turns.push({ id, who, text });
-					if (turns.length > 30) turns.splice(0, turns.length - 30);
-				};
-				const paint = () => {
-					setFooter(`realtime · ${voice}  ${micMeter(level)}`);
+				model.voice = voice;
+				model.connected = false;
+				model.level = 0;
+				model.harnessStatus = "";
+				model.notice = "connecting…";
+				model.turns = [];
+				model.frame = 0;
+				ensureWidget(ctx);
+				refreshSidebar();
+				const noteTrouble = (status: string) => {
+					model.notice = status;
+					refreshSidebar();
+					if (!status || !ctx.hasUI || sidebar.showing) return;
+					const shown = status.length > 400 ? `${status.slice(0, 400)}…` : status;
+					ctx.ui.notify(shown, "error");
 				};
 				session = await startRealtimeVoice({
 					voice,
 					getToken: () => deps.getToken(ctx),
 					onLevel: (next) => {
-						level = next;
-						paint();
+						model.level = next;
+						refreshSidebar();
 					},
 					onCaption: (kind, text, id) => {
 						showCaption(kind === "user" ? "you" : "voice", text, id);
-						paint();
 					},
-					onStatus: (status) => {
-						if (!status || !ctx.hasUI) return;
-						const shown = status.length > 400 ? `${status.slice(0, 400)}…` : status;
-						ctx.ui.notify(shown, "error");
+					onHarnessStatus: (status) => {
+						model.harnessStatus = status;
+						refreshSidebar();
 					},
+					onStatus: noteTrouble,
 					onSelfStop: (reason) => {
 						teardownSession();
 						if (reason === "voice") {
@@ -1461,12 +1466,21 @@ export function registerRealtimeVoice(
 						currentId: () => ctx.sessionManager.getSessionId?.() ?? undefined,
 						dir: () => ctx.sessionManager.getSessionDir?.() ?? undefined,
 						currentText: () =>
-							formatChatLog(ctx.sessionManager.buildSessionContext().messages),
+							formatChatLog(
+								(
+									ctx.sessionManager as unknown as {
+										buildSessionContext(): { messages: unknown[] };
+									}
+								).buildSessionContext().messages,
+							),
 					},
 				});
+				model.connected = true;
+				model.voice = session.voice;
+				model.notice = "";
 				enableObserverTools();
-				openVoiceDialog();
-				setFooter(`realtime · ${session.voice}  ${micMeter(0)}`);
+				syncActivity();
+				refreshSidebar();
 			} catch (e) {
 				try {
 					await session?.stop();
@@ -1492,15 +1506,62 @@ export function registerRealtimeVoice(
 			"Set the realtime voice: /realtime-voice-select eve (also used by /listen)",
 		handler: async (args, ctx) => {
 			statusCtx = ctx;
+			rememberCwd(ctx);
 			const next = args.trim();
 			if (!next) {
 				const current = (await deps.readVoice()) || DEFAULT_VOICE;
-				setFooter(session?.connected() ? `realtime · ${current}` : `voice · ${current}`);
+				model.voice = current;
+				if (session?.connected()) refreshSidebar();
+				else setFooter(`voice · ${current}`);
 				return;
 			}
 			await deps.writeVoice(next);
+			model.voice = next;
 			if (session?.connected()) session.setVoice(next);
-			setFooter(session?.connected() ? `realtime · ${next}` : `voice · ${next}`);
+			if (session?.connected()) refreshSidebar();
+			else setFooter(`voice · ${next}`);
+		},
+	});
+
+	pi.registerCommand("realtime-voice-sidebar", {
+		description:
+			"Show, hide, or resize the realtime voice sidebar: on | off | width <10-120>",
+		handler: async (args, ctx) => {
+			statusCtx = ctx;
+			rememberCwd(ctx);
+			const parsed = parseVoiceSidebarCommand(args ?? "");
+			if (parsed.type === "usage") {
+				ctx.ui.notify(VOICE_SIDEBAR_USAGE, "warning");
+				return;
+			}
+			if (parsed.type === "width") {
+				sidebar.setWidth(parsed.width);
+				refreshSidebar();
+				ctx.ui.notify(`Voice sidebar width set to ${parsed.width}`, "info");
+				return;
+			}
+			sidebar.setEnabled(parsed.type === "on");
+			syncActivity();
+			refreshSidebar();
+			ctx.ui.notify(
+				`Voice sidebar ${parsed.type === "on" ? "enabled" : "disabled"}`,
+				"info",
+			);
+		},
+	});
+
+	pi.registerShortcut("ctrl+shift+v", {
+		description: "Toggle the realtime voice sidebar",
+		handler: async (ctx) => {
+			statusCtx = ctx;
+			rememberCwd(ctx);
+			sidebar.setEnabled(!sidebar.enabled);
+			syncActivity();
+			refreshSidebar();
+			ctx.ui.notify(
+				`Voice sidebar ${sidebar.enabled ? "enabled" : "disabled"}`,
+				"info",
+			);
 		},
 	});
 
