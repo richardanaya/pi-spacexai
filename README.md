@@ -73,9 +73,18 @@ What happens:
 3. The voice agent calls **`send_task`**. The job is steered into the current pi turn. The tool returns a receipt. The outcome comes back later as `work_landed`.
 4. While the session is running, the coding agent gains two tools (removed again on stop):
    - **`send_message_to_observer`** — queues a `work_landed` update. The session then calls `read_background_updates` so the voice agent can speak it
-   - **`set_harness_status`** — short status line in the terminal (not spoken)
+   - **`set_harness_status`** — short status line in the voice sidebar (not spoken)
 5. The coding-agent system prompt is extended with observer instructions for the duration of the session.
 6. Five minutes of silence disconnects the socket. Speaking resets that timer.
+7. Voice state is drawn in a **right-hand sidebar** (connection, voice name, microphone level, harness status, and the you/voice transcript). The chat column narrows to make room. This follows the [pi-sidebar-tui](https://github.com/bi0h4z4rd88/pi-sidebar-tui) compositor: `terminal.columns` is reduced, and the panel is painted into the rightmost columns after each TUI frame inside one synchronized update. Rows are rewritten only when their text changes.
+
+```text
+/realtime-voice-sidebar on
+/realtime-voice-sidebar off
+/realtime-voice-sidebar width 40
+```
+
+Ctrl+Shift+V toggles the sidebar (rebind it in `~/.pi/agent/keybindings.json`). Width is 10–120 columns and is remembered in `~/.pi/agent/spacexai-voice-sidebar.json`. Hiding the sidebar restores the full-width chat and leaves a one-line footer (`realtime · voice`, the mic meter, and harness status).
 
 Default voice is **leo**. `/realtime-voice-select` and `/spacexai-voice` write the same `~/.pi/spacexai.json` voice. Selecting a voice during a live session applies it immediately.
 
@@ -89,7 +98,7 @@ Voice-agent tools:
 Coding-agent tools (only while realtime voice is running):
 
 - `send_message_to_observer` — spoken update / answer for the user via the voice agent
-- `set_harness_status` — live “what the harness is doing” text in the terminal
+- `set_harness_status` — live “what the harness is doing” text in the voice sidebar
 
 ## Load and authenticate
 
@@ -165,6 +174,9 @@ Esc                      # cancel push-to-talk and restore the editor
 /spacexai-voice eve
 /realtime-voice-start
 /realtime-voice-select eve
+/realtime-voice-sidebar on
+/realtime-voice-sidebar width 40
+Ctrl+Shift+V                 # toggle the realtime voice sidebar
 /realtime-voice-stop
 /set-speaking-style warm, measured, and conversational
 /remove-speaking-style
