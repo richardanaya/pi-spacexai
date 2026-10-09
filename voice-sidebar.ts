@@ -79,6 +79,8 @@ export interface SidebarTui {
 	terminal: SidebarTerminal;
 	requestRender?: () => void;
 	addInputListener?: (listener: (data: string) => SidebarInputResult | undefined) => () => void;
+	/** Present on pi's TUI. The compositor wraps it so a sidebar wheel is handled first. */
+	handleTerminalInput?: (data: string) => void;
 }
 
 /** pi's TUI.doRender is private in the types and public at runtime. */
