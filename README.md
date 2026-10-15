@@ -17,7 +17,7 @@ At request time, tokens come from pi’s model registry (`getApiKeyForProvider("
 Generate and edit images, or create, edit, and extend videos without leaving the coding harness. Requests expose the documented Grok Imagine controls rather than hiding them behind simplified presets:
 
 - Text-to-image and image editing with up to five source images (grok-imagine-image-2.0 supports up to 5; older models may reject >3)
-- Full support for **grok-imagine-image-2.0** with `quality` (`low`, `medium`, or `auto`), `1k` / `1.5k` / `2k`, and aspect ratios through `21:9` and `5:2`. Retired slugs `grok-imagine-image-quality` and `grok-imagine-image-pro` are rewritten to 2.0.
+- Full support for **grok-imagine-image-2.0** with `quality` (`low`, `medium`, or `auto`), `1k` / `1.5k` / `2k`, and aspect ratios through `21:9` and `5:2`. **grok-imagine-image-quality** is still a listed model ($0.05/image) until November 2, 2026 and is sent as itself. `grok-imagine-image-pro` is an alias of that model and is also sent unchanged. The `quality` parameter is only for 2.0.
 - Optional `storage_options` for server-side file storage with custom filenames, expiry times, and public URLs
 - 1–10 image variations, every supported aspect ratio, and 1K/2K resolution
 - Correct Files API `file_id` handling for image edits
@@ -62,13 +62,14 @@ Start a **Grok speech-to-speech** co-pilot in this terminal. There is no browser
 
 ```text
 /realtime-voice-start
+/realtime-voice-model        # default grok-voice-3.0; also grok-voice-latest or grok-voice-2.0
 /realtime-voice-select eve   # no argument prints the current voice
 /realtime-voice-stop
 ```
 
 What happens:
 
-1. The extension mints an ephemeral token and connects to `grok-voice-latest` with server VAD.
+1. The extension mints an ephemeral token and connects to **`grok-voice-3.0`** (PCM16 mono at 24 kHz, server VAD, input transcription model `grok-transcribe`). `grok-voice-latest` still aliases 3.0, and deprecated `grok-voice-2.0` stays selectable with `/realtime-voice-model`. Text to Speech has no model id. Speech to Text stays on `grok-voice-transcribe-2.0`.
 2. The microphone is raw PCM from **arecord** (Linux) or **ffmpeg**. Replies play through **aplay**, **paplay**, or **ffplay**. Spoken words are not written into the chat.
 3. The voice agent calls **`send_task`**. The job is steered into the current pi turn. The tool returns a receipt. The outcome comes back later as `work_landed`.
 4. While the session is running, the coding agent gains two tools (removed again on stop):
@@ -76,7 +77,7 @@ What happens:
    - **`set_harness_status`** — short status line in the voice sidebar (not spoken)
 5. The coding-agent system prompt is extended with observer instructions for the duration of the session.
 6. Five minutes of silence disconnects the socket. Speaking resets that timer.
-7. Voice state is drawn in a **right-hand sidebar** (connection, voice name, microphone level, harness status, and the you/voice transcript). The chat column narrows to make room. This follows the [pi-sidebar-tui](https://github.com/bi0h4z4rd88/pi-sidebar-tui) compositor: `terminal.columns` is reduced, and the panel is painted into the rightmost columns after each TUI frame inside one synchronized update. Rows are rewritten only when their text changes.
+7. Voice state is drawn in a **right-hand sidebar** (connection, voice name, speech-to-speech model, microphone level, harness status, and the you/voice transcript). The chat column narrows to make room. This follows the [pi-sidebar-tui](https://github.com/bi0h4z4rd88/pi-sidebar-tui) compositor: `terminal.columns` is reduced, and the panel is painted into the rightmost columns after each TUI frame inside one synchronized update. Rows are rewritten only when their text changes.
 
 ```text
 /realtime-voice-sidebar width 40
@@ -137,14 +138,14 @@ Select Grok models with `/model` under provider **`xai`** (built into pi).
 
 ## REST media tools
 
-- `image_gen`: model (`grok-imagine-image` or `grok-imagine-image-2.0`), prompt, 1–10 images, every documented aspect ratio (including `21:9` and `5:2`), `1k`/`1.5k`/`2k` resolution, optional `quality` (`low`/`medium`/`auto`, 2.0 only; omit or `auto` lets the service choose), optional `deferred` polling of `GET /v1/images/{request_id}` (URL responses only), optional `storage_options` (filename, expiry, public_url), URL/base64 response, and a required output path. `grok-imagine-image-quality` and `grok-imagine-image-pro` are accepted and rewritten to `grok-imagine-image-2.0` with `quality: "low"` when `quality` is omitted.
-- `image_edit`: single or up to five source images (grok-imagine-image-2.0 supports up to 5; older models may reject >3), the same model rewrite, `quality`, `n` (1–10), `deferred`, and `storage_options`, correct `file_id` handling for Files API inputs, and a required output path.
+- `image_gen`: model (`grok-imagine-image`, `grok-imagine-image-quality`, or `grok-imagine-image-2.0`), prompt, 1–10 images, every documented aspect ratio (including `21:9` and `5:2`), `1k`/`1.5k`/`2k` resolution, optional `quality` (`low`/`medium`/`auto`, 2.0 only; omit or `auto` lets the service choose), optional `deferred` polling of `GET /v1/images/{request_id}` (URL responses only), optional `storage_options` (filename, expiry, public_url), URL/base64 response, and a required output path. `grok-imagine-image-quality` is sent unchanged while it remains listed. `grok-imagine-image-pro` is an alias of that model and is also sent unchanged.
+- `image_edit`: single or up to five source images (grok-imagine-image-2.0 supports up to 5; older models may reject >3), the same models, `quality` on 2.0 only, `n` (1–10), `deferred`, and `storage_options`, correct `file_id` handling for Files API inputs, and a required output path.
 - `text_to_video`: prompt → video (`grok-imagine-video`, `grok-imagine-video-1.5`, or `grok-imagine-video-1.5-lite`), duration 1–15s, aspect ratio (including `21:9` and `5:2`), 480p/720p/1080p, optional `generate_audio` (default on). 1080p is native on 1.5 and upscaled from 720p on 1.5-lite. `grok-imagine-video` stops at 720p. Optional `storage_options`. Polls until completion and downloads to a required output path.
 - `image_to_video`: single source image → video (optional prompt, duration, resolution, optional `generate_audio`, optional `last_frame` on 1.5). `aspect_ratio` is ignored; the clip matches the still. `last_frame` turns the request into reference-to-video with a pinned first frame. `file_id` inputs use the Files API shape. Polls until completion and downloads to a required output path.
 - `reference_to_video`: up to 14 reference images on 1.5 (7 on `grok-imagine-video`), up to 3 preset voices (`reference_audios[].voice_id`, tag `<AUDIO_0>`), optional first-frame `image`, `last_frame`, up to 4 `keyframes` (`timestamp_s` strictly inside the clip), and optional `generate_audio`. At least one reference or pin is required. Prompt is required unless a frame is pinned. Resolution cap for this mode is 720p. `grok-imagine-video` reference clips are capped at 10 seconds. 1.5-lite does not support this mode. Partner-only custom audio clips can be passed as `reference_audios[].audio`.
 - `video_edit`: prompt and an mp4 (`url` or `file_id`) on `grok-imagine-video`. 1.5 and 1.5-lite do not edit. Optional `storage_options`. It polls until completion. Output duration and resolution follow the source, capped at 8.7 seconds and 720p.
 - `video_extend`: prompt and an mp4 on `grok-imagine-video`, optional 2–10 second extension duration (default 6), optional `storage_options`. The source video must be 2–15 seconds. It polls until completion.
-- `text_to_speech`: text up to 60,000 characters, language, voice, speed, codec, sample rate, MP3 bit rate, latency optimization (`0`, `1`, or `2`), an optional `replace` pronunciation map, normalization, timestamps, and a required `outputPath`. The tool only saves audio and does not play it. Timestamp envelopes can be saved separately.
+- `text_to_speech`: text up to 60,000 characters, language, voice, speed, codec, sample rate, MP3 bit rate, latency optimization (`0`, `1`, or `2`), an optional `replace` pronunciation map, normalization, timestamps, and a required `outputPath`. The Text to Speech API has no model id (it is not `grok-voice-3.0`) and is billed at $15 per 1M characters. The tool only saves audio and does not play it. Timestamp envelopes can be saved separately.
 - `speech_to_text`: file or URL transcription with raw format/sample rate, language/formatting, multichannel/channels, diarization, repeatable keyterms, filler words, `vad_threshold` (0–1), and `model` (default `grok-voice-transcribe-2.0`; `grok-voice-transcribe-1.0` is rewritten to 2.0).
 - `list_speech_voices`: list built-in voices from `GET /v1/tts/voices` and this team's custom voices from `GET /v1/custom-voices`.
 
@@ -171,6 +172,7 @@ Esc                      # cancel push-to-talk and restore the editor
 /auto-listen-off
 /spacexai-voice eve
 /realtime-voice-start
+/realtime-voice-model grok-voice-2.0
 /realtime-voice-select eve
 /realtime-voice-sidebar width 40
 /realtime-voice-stop
@@ -180,4 +182,6 @@ Esc                      # cancel push-to-talk and restore the editor
 
 Playback requires `ffplay` from FFmpeg. TTS text is limited to 60,000 characters. `/set-speaking-style` stores a persistent style description and injects it into the system prompt so responses are written for that delivery; `/remove-speaking-style` clears it. Slash-command configuration is stored at `~/.pi/spacexai.json` with user-only permissions.
 
-Voice input streams raw PCM16 mono @ 16 kHz over `wss://api.x.ai/v1/stt` (`model=grok-voice-transcribe-2.0`, `interim_results=true`). On release the client sends `finalize` then `audio.done` and uses the resulting transcript. Local recorder preference: **arecord** (ALSA raw PCM on Linux), then **ffmpeg** (stdout s16le). Auth is the same xAI bearer from pi’s model registry.
+Voice input streams raw PCM16 mono @ 16 kHz over `wss://api.x.ai/v1/stt` (`model=grok-voice-transcribe-2.0`, `interim_results=true`). That model is separate from Grok Voice 3.0. `grok-voice-transcribe-1.0` reached end of life on October 2, 2026 and is rewritten to 2.0. On release the client sends `finalize` then `audio.done` and uses the resulting transcript. Local recorder preference: **arecord** (ALSA raw PCM on Linux), then **ffmpeg** (stdout s16le). Auth is the same xAI bearer from pi’s model registry.
+
+Realtime voice (`/realtime-voice-start`) uses `wss://api.x.ai/v1/realtime?model=grok-voice-3.0` unless `/realtime-voice-model` pins `grok-voice-latest` or deprecated `grok-voice-2.0`. The choice is stored in `~/.pi/spacexai.json` and applies on the next start. Session audio is PCM16 at 24 kHz. Function tools use the flat speech-to-speech schema (`type`, `name`, `description`, `parameters`). Pricing for speech to speech is $0.08 per minute plus $0.004 per text input, the same for 3.0 and 2.0. Built-in voices are unchanged (`eve` is the API default; this extension still defaults to **leo**) and are loaded from `GET /v1/tts/voices`.

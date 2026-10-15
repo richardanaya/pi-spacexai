@@ -8,10 +8,17 @@ import {
 	buildXSearchTool,
 	COMPLETIONS_FORBIDDEN_TOOL_TYPES,
 	customVoicePage,
+	buildRealtimeSessionUpdate,
+	buildRealtimeUrl,
 	DEFAULT_RESPONSES_MODEL,
+	IMAGE_MODEL_QUALITY,
 	MAX_REFERENCE_IMAGES,
 	mergeVoiceCatalog,
 	normalizeImageRequest,
+	REALTIME_MODEL,
+	REALTIME_TRANSCRIBE_MODEL,
+	realtimeFunctionTool,
+	resolveRealtimeModel,
 	resolveSttModel,
 	responsesOutputText,
 	responsesSearchModel,
@@ -127,14 +134,18 @@ test("responses text keeps url citations and usage details", () => {
 	);
 });
 
-test("retired image slugs map to imagine 2.0 quality low", () => {
+test("grok-imagine-image-quality is sent as itself", () => {
 	assert.deepEqual(
-		normalizeImageRequest({ model: "grok-imagine-image-quality", prompt: "cat" }),
-		{ model: "grok-imagine-image-2.0", prompt: "cat", quality: "low" },
+		normalizeImageRequest({ model: IMAGE_MODEL_QUALITY, prompt: "cat" }),
+		{ model: "grok-imagine-image-quality", prompt: "cat" },
+	);
+	assert.deepEqual(
+		normalizeImageRequest({ model: "grok-imagine-image-pro", prompt: "cat" }),
+		{ model: "grok-imagine-image-pro", prompt: "cat" },
 	);
 	assert.deepEqual(
 		normalizeImageRequest({
-			model: "grok-imagine-image-pro",
+			model: "grok-imagine-image-2.0",
 			prompt: "cat",
 			quality: "medium",
 		}),
@@ -143,6 +154,14 @@ test("retired image slugs map to imagine 2.0 quality low", () => {
 	assert.deepEqual(
 		normalizeImageRequest({ model: "grok-imagine-image", prompt: "cat" }),
 		{ model: "grok-imagine-image", prompt: "cat" },
+	);
+	assert.throws(
+		() =>
+			normalizeImageRequest({
+				model: IMAGE_MODEL_QUALITY,
+				quality: "low",
+			}),
+		/only supported on grok-imagine-image-2.0/,
 	);
 	assert.throws(
 		() =>
@@ -161,6 +180,74 @@ test("retired image slugs map to imagine 2.0 quality low", () => {
 			}),
 		/response_format "url"/,
 	);
+});
+
+test("realtime voice defaults to grok-voice-3.0 and keeps 2.0 selectable", () => {
+	assert.equal(resolveRealtimeModel(undefined), REALTIME_MODEL);
+	assert.equal(resolveRealtimeModel("  "), REALTIME_MODEL);
+	assert.equal(resolveRealtimeModel("grok-voice-3.0"), "grok-voice-3.0");
+	assert.equal(resolveRealtimeModel("grok-voice-latest"), "grok-voice-latest");
+	assert.equal(resolveRealtimeModel("grok-voice-2.0"), "grok-voice-2.0");
+	assert.throws(
+		() => resolveRealtimeModel("grok-voice-transcribe-2.0"),
+		/Unknown realtime model/,
+	);
+	const url = new URL(buildRealtimeUrl("grok-voice-2.0"));
+	assert.equal(url.protocol, "wss:");
+	assert.equal(url.pathname, "/v1/realtime");
+	assert.equal(url.searchParams.get("model"), "grok-voice-2.0");
+	assert.equal(new URL(buildRealtimeUrl()).searchParams.get("model"), REALTIME_MODEL);
+	const session = buildRealtimeSessionUpdate({
+		voice: "leo",
+		instructions: "Help.",
+		sampleRate: 24000,
+		tools: [
+			realtimeFunctionTool({
+				name: "send_task",
+				description: "Request a job.",
+				parameters: { type: "object", properties: {} },
+			}),
+		],
+	}) as {
+		type: string;
+		session: {
+			voice: string;
+			turn_detection: Record<string, unknown>;
+			audio: {
+				input: { format: { type: string; rate: number }; transcription: { model: string } };
+				output: { format: { type: string; rate: number } };
+			};
+			tools: Array<Record<string, unknown>>;
+		};
+	};
+	assert.equal(session.type, "session.update");
+	assert.equal(session.session.voice, "leo");
+	assert.deepEqual(session.session.turn_detection, {
+		type: "server_vad",
+		threshold: 0.3,
+		silence_duration_ms: 500,
+	});
+	assert.deepEqual(session.session.audio.input.format, {
+		type: "audio/pcm",
+		rate: 24000,
+	});
+	assert.deepEqual(session.session.audio.output.format, {
+		type: "audio/pcm",
+		rate: 24000,
+	});
+	assert.equal(session.session.audio.input.transcription.model, REALTIME_TRANSCRIBE_MODEL);
+	assert.deepEqual(session.session.tools[0], {
+		type: "function",
+		name: "send_task",
+		description: "Request a job.",
+		parameters: { type: "object", properties: {} },
+	});
+	assert.equal("function" in session.session.tools[0], false);
+});
+
+test("tts body has no speech-to-speech model field", () => {
+	const body = buildTtsBody({ text: "hello", language: "en", voice_id: "leo" });
+	assert.equal("model" in body, false);
 });
 
 test("speech model and websocket query pin transcribe 2.0", () => {

@@ -38,6 +38,8 @@ export interface VoiceTurn {
 export interface VoiceSidebarModel {
 	connected: boolean;
 	voice: string;
+	/** Speech-to-speech model id, when a session has chosen one. */
+	realtimeModel?: string;
 	/** Mic level from 0 (silence) to 1 (loud). */
 	level: number;
 	harnessStatus: string;
@@ -269,6 +271,10 @@ function renderVoicePanel(model: VoiceSidebarModel, width: number): string[] {
 		: dim("·");
 	const voice = trunc(model.voice || "leo", Math.max(1, width - 16));
 	lines.push(` ${mark} ${state}${dim(" · ")}${fg("accent", voice)}`);
+	const realtimeModel = model.realtimeModel?.replace(/\s+/g, " ").trim();
+	if (realtimeModel) {
+		lines.push(dim(` ${trunc(realtimeModel, Math.max(1, width - 2))}`));
+	}
 	const hot = model.level > 0.05;
 	lines.push(
 		`${dim(" mic ")}${fg(hot ? "success" : "muted", micMeter(model.level))}`,
@@ -429,7 +435,11 @@ export function voiceFooterLabel(
 	const notice = model.notice.replace(/\s+/g, " ").trim();
 	const harness = model.harnessStatus.replace(/\s+/g, " ").trim();
 	if (!model.connected) return notice || undefined;
-	const bits = [`realtime · ${model.voice || "leo"}`, micMeter(model.level)];
+	const realtimeModel = model.realtimeModel?.replace(/\s+/g, " ").trim();
+	const bits = [
+		`realtime · ${model.voice || "leo"}${realtimeModel ? ` · ${realtimeModel}` : ""}`,
+		micMeter(model.level),
+	];
 	if (notice) bits.push(notice.length > 80 ? `${notice.slice(0, 80)}…` : notice);
 	if (harness) bits.push(harness.length > 80 ? `${harness.slice(0, 80)}…` : harness);
 	return bits.join("  ");

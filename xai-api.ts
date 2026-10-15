@@ -5,24 +5,37 @@
  */
 
 export const DEFAULT_RESPONSES_MODEL = "grok-4.7";
-/** Current Speech-to-Text model. grok-voice-transcribe-1.0 ended October 2, 2026. */
+/**
+ * Speech-to-text model. grok-voice-3.0 is speech-to-speech only and is not
+ * accepted on /v1/stt. grok-voice-transcribe-1.0 reached end of life on
+ * October 2, 2026 and is no longer listed; those requests are rewritten to 2.0.
+ */
 export const STT_MODEL = "grok-voice-transcribe-2.0";
 export const STT_WS_BASE = "wss://api.x.ai/v1/stt";
+export const REALTIME_URL = "wss://api.x.ai/v1/realtime";
+/** Flagship speech-to-speech model. grok-voice-latest currently aliases this. */
+export const REALTIME_MODEL = "grok-voice-3.0";
+/**
+ * Models the realtime handshake still lists. grok-voice-2.0 is deprecated.
+ * grok-voice-latest follows the current flagship.
+ */
+export const REALTIME_MODELS = [
+	"grok-voice-3.0",
+	"grok-voice-latest",
+	"grok-voice-2.0",
+] as const;
+/** Input transcription model inside a speech-to-speech session. Not an STT slug. */
+export const REALTIME_TRANSCRIBE_MODEL = "grok-transcribe";
 export const IMAGE_MODEL_2 = "grok-imagine-image-2.0";
+/**
+ * Still a listed Imagine model ($0.05/image) until November 2, 2026.
+ * grok-imagine-image-pro is an alias of this slug.
+ */
+export const IMAGE_MODEL_QUALITY = "grok-imagine-image-quality";
 /** grok-imagine-video-1.5 accepts 14; grok-imagine-video still caps at 7. */
 export const MAX_REFERENCE_IMAGES = 14;
 export const MAX_X_HANDLES = 20;
 export const MAX_WEB_DOMAINS = 5;
-
-/**
- * grok-imagine-image-pro redirected on May 15, 2026.
- * grok-imagine-image-quality retires November 2, 2026, served as 2.0 at quality low.
- * Both are rewritten now so callers pick the documented replacement explicitly.
- */
-const RETIRED_IMAGE_MODELS = new Set([
-	"grok-imagine-image-quality",
-	"grok-imagine-image-pro",
-]);
 
 export const VIDEO_ASPECT_RATIOS = [
 	"1:1",
@@ -195,12 +208,11 @@ export function normalizeImageRequest(
 ): Record<string, unknown> {
 	const next = { ...body };
 	const model = typeof next.model === "string" ? next.model : undefined;
-	if (model && RETIRED_IMAGE_MODELS.has(model)) {
-		next.model = IMAGE_MODEL_2;
-		if (next.quality === undefined) next.quality = "low";
-	} else if (model === "grok-imagine-image" && next.quality !== undefined) {
+	// quality (low | medium | auto) exists only on grok-imagine-image-2.0.
+	// grok-imagine-image-quality is its own model until November 2, 2026.
+	if (model && model !== IMAGE_MODEL_2 && next.quality !== undefined) {
 		throw new Error(
-			"quality is only supported on grok-imagine-image-2.0. grok-imagine-image-quality and grok-imagine-image-pro are rewritten to grok-imagine-image-2.0.",
+			`quality is only supported on ${IMAGE_MODEL_2}. ${IMAGE_MODEL_QUALITY} is a separate model, and grok-imagine-image-pro is an alias of it.`,
 		);
 	}
 	if (next.deferred === true && next.response_format === "b64_json") {
@@ -214,6 +226,78 @@ export function normalizeImageRequest(
 export function resolveSttModel(model?: string): string {
 	if (!model || model === "grok-voice-transcribe-1.0") return STT_MODEL;
 	return model;
+}
+
+export function resolveRealtimeModel(model?: string): string {
+	const id = model?.trim();
+	if (!id) return REALTIME_MODEL;
+	if ((REALTIME_MODELS as readonly string[]).includes(id)) return id;
+	throw new Error(
+		`Unknown realtime model "${id}". Choose ${REALTIME_MODELS.join(", ")}.`,
+	);
+}
+
+export function buildRealtimeUrl(model?: string, base = REALTIME_URL): string {
+	let url: URL;
+	try {
+		url = new URL(base);
+	} catch (error) {
+		throw new Error(
+			`Invalid realtime websocket URL: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	url.searchParams.set("model", resolveRealtimeModel(model));
+	return url.toString();
+}
+
+/** Speech-to-speech function tools are flat. The nested Chat Completions shape is not the documented session schema. */
+export function realtimeFunctionTool(tool: {
+	name: string;
+	description: string;
+	parameters: Record<string, unknown>;
+}): Record<string, unknown> {
+	return {
+		type: "function",
+		name: tool.name,
+		description: tool.description,
+		parameters: tool.parameters,
+	};
+}
+
+/**
+ * session.update for Grok Voice. The published parameters are
+ * turn_detection.type and turn_detection.idle_timeout_ms. threshold and
+ * silence_duration_ms are the OpenAI Realtime fields this client already
+ * sends; Voice 3.0 documents the same API, so they stay.
+ * Input transcription stays on grok-transcribe, which is separate from
+ * grok-voice-3.0 and from grok-voice-transcribe-2.0.
+ */
+export function buildRealtimeSessionUpdate(input: {
+	voice: string;
+	instructions: string;
+	sampleRate: number;
+	tools: Record<string, unknown>[];
+}): Record<string, unknown> {
+	return {
+		type: "session.update",
+		session: {
+			voice: input.voice,
+			instructions: input.instructions,
+			turn_detection: {
+				type: "server_vad",
+				threshold: 0.3,
+				silence_duration_ms: 500,
+			},
+			audio: {
+				input: {
+					format: { type: "audio/pcm", rate: input.sampleRate },
+					transcription: { model: REALTIME_TRANSCRIBE_MODEL },
+				},
+				output: { format: { type: "audio/pcm", rate: input.sampleRate } },
+			},
+			tools: input.tools,
+		},
+	};
 }
 
 export function buildSttWsUrl(options: {
@@ -240,6 +324,10 @@ export function buildSttWsUrl(options: {
 	return url.toString();
 }
 
+/**
+ * POST /v1/tts has no model field. Text to Speech is billed per character
+ * and does not use grok-voice-3.0.
+ */
 export function buildTtsBody(input: {
 	text: string;
 	language: string;

@@ -64,11 +64,16 @@ test("sidebar layout matches the pi-sidebar-tui column split", () => {
 });
 
 test("renderVoiceSidebar shows voice status, harness status, and transcript", () => {
-	const lines = renderVoiceSidebar(model(), 40, 24);
+	const lines = renderVoiceSidebar(
+		model({ realtimeModel: "grok-voice-3.0" }),
+		40,
+		24,
+	);
 	const text = lines.map(strip).join("\n");
 	assert.match(text, /Voice/);
 	assert.match(text, /live/);
 	assert.match(text, /eve/);
+	assert.match(text, /grok-voice-3.0/);
 	assert.match(text, /mic/);
 	assert.match(text, new RegExp(micMeter(0.5)));
 	assert.match(text, /Harness/);
@@ -135,6 +140,10 @@ test("footer is hidden while the sidebar is showing", () => {
 	assert.equal(voiceFooterLabel(live, true), undefined);
 	const hidden = voiceFooterLabel(live, false);
 	assert.match(hidden ?? "", /realtime · eve/);
+	assert.match(
+		voiceFooterLabel(model({ realtimeModel: "grok-voice-3.0" }), false) ?? "",
+		/realtime · eve · grok-voice-3.0/,
+	);
 	assert.match(hidden ?? "", new RegExp(micMeter(0.5)));
 	assert.match(hidden ?? "", /Done: fixed auth/);
 	assert.equal(

@@ -24,6 +24,7 @@ import {
 	buildXSearchTool,
 	customVoicePage,
 	IMAGE_MODEL_2,
+	IMAGE_MODEL_QUALITY,
 	isRecord,
 	MAX_REFERENCE_IMAGES,
 	mergeVoiceCatalog,
@@ -51,6 +52,8 @@ const STT_CHUNK_BYTES = (STT_SAMPLE_RATE * 2) / 10;
 
 interface Config {
 	voice?: string;
+	/** Speech-to-speech model. Empty uses grok-voice-3.0. */
+	realtimeModel?: string;
 	language?: string;
 	speed?: number;
 	autoListen?: boolean;
@@ -631,7 +634,7 @@ export default function spacexai(pi: ExtensionAPI) {
 	const aspectVideo = literalUnion(VIDEO_ASPECT_RATIOS);
 	const imageCommon = {
 		model: Type.String({
-			description: `grok-imagine-image or ${IMAGE_MODEL_2}. grok-imagine-image-quality and grok-imagine-image-pro are accepted and rewritten to ${IMAGE_MODEL_2} (quality low when quality is omitted).`,
+			description: `grok-imagine-image, ${IMAGE_MODEL_QUALITY}, or ${IMAGE_MODEL_2}. grok-imagine-image-pro is an alias of ${IMAGE_MODEL_QUALITY} and is sent unchanged. quality is ${IMAGE_MODEL_2} only.`,
 		}),
 		prompt: Type.String(),
 		aspect_ratio: Type.Optional(aspectImage),
@@ -1204,7 +1207,7 @@ export default function spacexai(pi: ExtensionAPI) {
 					minimum: 0,
 					maximum: 1,
 					description:
-						"Voice-activity gate from 0 to 1. Lower keeps quieter speech. 0 disables the gate. Default 0.5.",
+						"Voice-activity gate from 0 to 1. Lower keeps quieter speech. 0 disables the gate. The API default is 0.08.",
 				}),
 			),
 			outputPath: Type.Optional(
@@ -1412,6 +1415,12 @@ export default function spacexai(pi: ExtensionAPI) {
 		writeVoice: async (voice) => {
 			const config = await readConfig();
 			config.voice = voice;
+			await saveConfig(config);
+		},
+		readRealtimeModel: async () => (await readConfig()).realtimeModel,
+		writeRealtimeModel: async (realtimeModel) => {
+			const config = await readConfig();
+			config.realtimeModel = realtimeModel;
 			await saveConfig(config);
 		},
 	});

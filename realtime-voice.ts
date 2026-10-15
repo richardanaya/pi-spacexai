@@ -29,6 +29,13 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import {
+	buildRealtimeSessionUpdate,
+	buildRealtimeUrl,
+	REALTIME_MODELS,
+	realtimeFunctionTool,
+	resolveRealtimeModel,
+} from "./xai-api.ts";
+import {
 	createRenderScheduler,
 	parseVoiceSidebarCommand,
 	setVoiceSidebarTheme,
@@ -39,8 +46,6 @@ import {
 } from "./voice-sidebar.ts";
 
 const API_BASE = "https://api.x.ai/v1";
-const REALTIME_URL = "wss://api.x.ai/v1/realtime";
-const DEFAULT_MODEL = "grok-voice-latest";
 const SAMPLE_RATE = 24_000;
 /** 100 ms of s16le mono. */
 const FRAME_BYTES = (SAMPLE_RATE * 2) / 10;
@@ -105,6 +110,7 @@ interface RealtimeVoiceOptions {
 
 interface RealtimeVoiceSession {
 	voice: string;
+	model: string;
 	setVoice: (voice: string) => boolean;
 	sendToObserver: (message: string) => boolean;
 	setHarnessStatus: (status: string) => boolean;
@@ -489,15 +495,14 @@ async function startRealtimeVoice(
 ): Promise<RealtimeVoiceSession> {
 	const playerSpec = await pickPlayer();
 	const recorderSpec = await pickRecorder();
-	const model = options.model ?? DEFAULT_MODEL;
+	const model = resolveRealtimeModel(options.model);
 	let voice = options.voice ?? DEFAULT_VOICE;
 	const instructions = options.instructions ?? DEFAULT_INSTRUCTIONS;
 
 	const token = await fetchClientSecret(await options.getToken());
-	const ws = new WebSocket(
-		`${REALTIME_URL}?model=${encodeURIComponent(model)}`,
-		[`xai-client-secret.${token}`],
-	);
+	const ws = new WebSocket(buildRealtimeUrl(model), [
+		`xai-client-secret.${token}`,
+	]);
 
 	let closed = false;
 	let stopping = false;
@@ -688,90 +693,67 @@ async function startRealtimeVoice(
 	}
 
 	function sessionUpdate(): void {
-		send({
-			type: "session.update",
-			session: {
+		send(
+			buildRealtimeSessionUpdate({
 				voice,
 				instructions,
-				turn_detection: {
-					type: "server_vad",
-					threshold: 0.3,
-					silence_duration_ms: 500,
-				},
-				audio: {
-					input: {
-						format: { type: "audio/pcm", rate: SAMPLE_RATE },
-						transcription: { model: "grok-transcribe" },
-					},
-					output: { format: { type: "audio/pcm", rate: SAMPLE_RATE } },
-				},
+				sampleRate: SAMPLE_RATE,
 				tools: [
-					{
-						type: "function",
-						function: {
-							name: "send_task",
-							description:
-								"Request a job. Returns a receipt. The outcome arrives later as work_landed through read_background_updates. Rejects requests over 2000 characters instead of truncating them.",
-							parameters: {
-								type: "object",
-								properties: {
-									request: {
-										type: "string",
-										description: "The job to do. Max 2000 characters.",
-									},
+					realtimeFunctionTool({
+						name: "send_task",
+						description:
+							"Request a job. Returns a receipt. The outcome arrives later as work_landed through read_background_updates. Rejects requests over 2000 characters instead of truncating them.",
+						parameters: {
+							type: "object",
+							properties: {
+								request: {
+									type: "string",
+									description: "The job to do. Max 2000 characters.",
 								},
-								required: ["request"],
 							},
+							required: ["request"],
 						},
-					},
-					{
-						type: "function",
-						function: {
-							name: "search_conversations",
-							description:
-								"Search prior conversations. Returns up to 6 hits, best first. Pass id to read that hit in full. scope is this-chat, earlier, or everything. from and to are YYYY-MM-DD. if_missing is say-no-record or send-task.",
-							parameters: {
-								type: "object",
-								properties: {
-									query: { type: "string", description: "What to look for." },
-									scope: {
-										type: "string",
-										description: "this-chat, earlier, or everything. Default everything.",
-									},
-									id: { type: "string", description: "Read that hit in full." },
-									from: { type: "string", description: "Start date, YYYY-MM-DD." },
-									to: { type: "string", description: "End date, YYYY-MM-DD." },
-									if_missing: {
-										type: "string",
-										description:
-											"say-no-record: tell the user there is no record. send-task: request a job when nothing matches.",
-									},
+					}),
+					realtimeFunctionTool({
+						name: "search_conversations",
+						description:
+							"Search prior conversations. Returns up to 6 hits, best first. Pass id to read that hit in full. scope is this-chat, earlier, or everything. from and to are YYYY-MM-DD. if_missing is say-no-record or send-task.",
+						parameters: {
+							type: "object",
+							properties: {
+								query: { type: "string", description: "What to look for." },
+								scope: {
+									type: "string",
+									description:
+										"this-chat, earlier, or everything. Default everything.",
 								},
-								required: ["query", "if_missing"],
+								id: { type: "string", description: "Read that hit in full." },
+								from: { type: "string", description: "Start date, YYYY-MM-DD." },
+								to: { type: "string", description: "End date, YYYY-MM-DD." },
+								if_missing: {
+									type: "string",
+									description:
+										"say-no-record: tell the user there is no record. send-task: request a job when nothing matches.",
+								},
 							},
+							required: ["query", "if_missing"],
 						},
-					},
-					{
-						type: "function",
-						function: {
-							name: "end_the_call",
-							description:
-								"Hang up. Use only on a parting greeting, and say goodbye out loud first.",
-							parameters: { type: "object", properties: {} },
-						},
-					},
-					{
-						type: "function",
-						function: {
-							name: "read_background_updates",
-							description:
-								"Read JSON background updates, including work_landed. The system calls this. Do not call it yourself.",
-							parameters: { type: "object", properties: {} },
-						},
-					},
+					}),
+					realtimeFunctionTool({
+						name: "end_the_call",
+						description:
+							"Hang up. Use only on a parting greeting, and say goodbye out loud first.",
+						parameters: { type: "object", properties: {} },
+					}),
+					realtimeFunctionTool({
+						name: "read_background_updates",
+						description:
+							"Read JSON background updates, including work_landed. The system calls this. Do not call it yourself.",
+						parameters: { type: "object", properties: {} },
+					}),
 				],
-			},
-		});
+			}),
+		);
 	}
 
 	async function issueTask(request: string): Promise<{ receipt: string }> {
@@ -1147,6 +1129,7 @@ async function startRealtimeVoice(
 	touchActivity();
 
 	return {
+		model,
 		get voice() {
 			return voice;
 		},
@@ -1185,6 +1168,8 @@ export function registerRealtimeVoice(
 		}) => Promise<string>;
 		readVoice: () => Promise<string | undefined>;
 		writeVoice: (voice: string) => Promise<void>;
+		readRealtimeModel: () => Promise<string | undefined>;
+		writeRealtimeModel: (model: string) => Promise<void>;
 	},
 ): void {
 	let session: RealtimeVoiceSession | null = null;
@@ -1199,6 +1184,7 @@ export function registerRealtimeVoice(
 	const model: VoiceSidebarModel = {
 		connected: false,
 		voice: DEFAULT_VOICE,
+		realtimeModel: "",
 		level: 0,
 		harnessStatus: "",
 		notice: "",
@@ -1406,7 +1392,11 @@ export function registerRealtimeVoice(
 			}
 			try {
 				const voice = (await deps.readVoice()) || DEFAULT_VOICE;
+				const realtimeModel = resolveRealtimeModel(
+					await deps.readRealtimeModel(),
+				);
 				model.voice = voice;
+				model.realtimeModel = realtimeModel;
 				model.connected = false;
 				model.level = 0;
 				model.harnessStatus = "";
@@ -1424,6 +1414,7 @@ export function registerRealtimeVoice(
 				};
 				session = await startRealtimeVoice({
 					voice,
+					model: realtimeModel,
 					getToken: () => deps.getToken(ctx),
 					onLevel: (next) => {
 						model.level = next;
@@ -1497,8 +1488,50 @@ export function registerRealtimeVoice(
 
 	pi.registerCommand("realtime-voice-start", {
 		description:
-			"Start Grok speech-to-speech in this terminal (mic + speaker)",
+			"Start Grok Voice 3.0 speech-to-speech in this terminal (mic + speaker)",
 		handler: startVoice,
+	});
+
+	pi.registerCommand("realtime-voice-model", {
+		description: `Pin the speech-to-speech model (${REALTIME_MODELS.join(", ")})`,
+		handler: async (args, ctx) => {
+			statusCtx = ctx;
+			const next = args.trim();
+			if (!next) {
+				let current = "";
+				try {
+					current = resolveRealtimeModel(await deps.readRealtimeModel());
+				} catch (error) {
+					ctx.ui.notify(
+						error instanceof Error ? error.message : String(error),
+						"warning",
+					);
+					return;
+				}
+				ctx.ui.notify(
+					`Realtime model is ${current}. Listed: ${REALTIME_MODELS.join(", ")}.`,
+					"info",
+				);
+				return;
+			}
+			let resolved: string;
+			try {
+				resolved = resolveRealtimeModel(next);
+			} catch (error) {
+				ctx.ui.notify(
+					error instanceof Error ? error.message : String(error),
+					"warning",
+				);
+				return;
+			}
+			await deps.writeRealtimeModel(resolved);
+			model.realtimeModel = resolved;
+			const live = session?.connected()
+				? " It applies the next time realtime voice starts."
+				: "";
+			ctx.ui.notify(`Realtime model set to ${resolved}.${live}`, "info");
+			if (session?.connected()) refreshSidebar();
+		},
 	});
 
 	pi.registerCommand("realtime-voice-select", {
